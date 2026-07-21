@@ -331,13 +331,14 @@ read_sni_value() {
     printf '  2) www.nvidia.com     (NVIDIA 官网)\n'
     printf '  3) www.amd.com        (AMD 官网)\n'
     printf '  4) www.speedtest.net  (全球测速网)\n'
-    printf '  5) 自定义域名\n'
+    printf '  5) www.itunes.com     (Apple iTunes)\n'
+    printf '  6) 自定义域名\n'
     if [[ -n $old_sni ]]; then
       printf '  直接回车：保持当前值 %s\n' "$old_sni"
     else
       printf '  直接回车：默认选择 www.epicgames.com\n'
     fi
-    read -r -p "请选择 [1-5]: " choice
+    read -r -p "请选择 [1-6]: " choice
 
     if [[ -z $choice && -n $old_sni ]]; then
       FAKE_SNI=$old_sni
@@ -347,12 +348,13 @@ read_sni_value() {
         2) FAKE_SNI="www.nvidia.com" ;;
         3) FAKE_SNI="www.amd.com" ;;
         4) FAKE_SNI="www.speedtest.net" ;;
-        5)
+        5) FAKE_SNI="www.itunes.com" ;;
+        6)
           read -r -p "请输入自定义 SNI 域名: " custom_sni
           FAKE_SNI=$custom_sni
           ;;
         *)
-          warn "请输入 1 到 5。"
+          warn "请输入 1 到 6。"
           continue
           ;;
       esac
