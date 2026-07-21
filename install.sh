@@ -151,23 +151,6 @@ install_dependencies() {
   find_stream_module >/dev/null 2>&1 || die "没有找到 Nginx Stream 模块。"
 }
 
-choose_proxy_port() {
-  local node_port=$1
-  local candidate=$((node_port + 1))
-
-  if (( candidate > 65535 )); then
-    candidate=39001
-  fi
-
-  while port_is_listening "$candidate" || [[ $candidate -eq $node_port ]]; do
-    candidate=$((candidate + 1))
-    if (( candidate > 65535 )); then
-      candidate=39001
-    fi
-  done
-  printf '%s\n' "$candidate"
-}
-
 write_state() {
   umask 077
   mkdir -p "$BASE_DIR"
@@ -199,7 +182,7 @@ pid /run/${APP}.pid;
 error_log /dev/null crit;
 
 events {
-    worker_connections 4096;
+    worker_connections 1024;
 }
 
 stream {
@@ -244,33 +227,40 @@ source "$STATE_FILE"
 manage_family() {
   local action=$1
   local ipt=$2
-  command -v "$ipt" >/dev/null 2>&1 || return 0
-  "$ipt" -t nat -L PREROUTING -n >/dev/null 2>&1 || return 0
+  if ! command -v "$ipt" >/dev/null 2>&1; then
+    [[ $action == stop ]] && return 0
+    echo "缺少 $ipt，无法保护后端端口。" >&2
+    return 1
+  fi
+  if ! "$ipt" -L INPUT -n >/dev/null 2>&1 ||
+    ! "$ipt" -t raw -L PREROUTING -n >/dev/null 2>&1; then
+    [[ $action == stop ]] && return 0
+    echo "$ipt 无法管理 INPUT 或 raw/PREROUTING 规则。" >&2
+    return 1
+  fi
 
-  local -a redirect_rule=(
-    -p tcp --dport "$NODE_PORT"
-    -m addrtype --dst-type LOCAL
-    -m comment --comment "${APP}-redirect"
-    -j REDIRECT --to-ports "$PROXY_PORT"
-  )
-  local -a direct_drop_rule=(
+  local -a front_accept_rule=(
     -p tcp --dport "$PROXY_PORT"
-    -m conntrack --ctorigdstport "$PROXY_PORT"
-    -m comment --comment "${APP}-direct-drop"
+    -m comment --comment "${APP}-front-accept"
+    -j ACCEPT
+  )
+  local -a backend_drop_rule=(
+    -p tcp --dport "$NODE_PORT"
+    -m comment --comment "${APP}-backend-drop"
     -j DROP
   )
 
   if [[ $action == start ]]; then
-    "$ipt" -t nat -C PREROUTING "${redirect_rule[@]}" >/dev/null 2>&1 ||
-      "$ipt" -t nat -I PREROUTING 1 "${redirect_rule[@]}"
-    "$ipt" -C INPUT "${direct_drop_rule[@]}" >/dev/null 2>&1 ||
-      "$ipt" -I INPUT 1 "${direct_drop_rule[@]}"
+    "$ipt" -t raw -C PREROUTING "${backend_drop_rule[@]}" >/dev/null 2>&1 ||
+      "$ipt" -t raw -I PREROUTING 1 "${backend_drop_rule[@]}"
+    "$ipt" -C INPUT "${front_accept_rule[@]}" >/dev/null 2>&1 ||
+      "$ipt" -I INPUT 1 "${front_accept_rule[@]}"
   else
-    while "$ipt" -t nat -C PREROUTING "${redirect_rule[@]}" >/dev/null 2>&1; do
-      "$ipt" -t nat -D PREROUTING "${redirect_rule[@]}"
+    while "$ipt" -C INPUT "${front_accept_rule[@]}" >/dev/null 2>&1; do
+      "$ipt" -D INPUT "${front_accept_rule[@]}"
     done
-    while "$ipt" -C INPUT "${direct_drop_rule[@]}" >/dev/null 2>&1; do
-      "$ipt" -D INPUT "${direct_drop_rule[@]}"
+    while "$ipt" -t raw -C PREROUTING "${backend_drop_rule[@]}" >/dev/null 2>&1; do
+      "$ipt" -t raw -D PREROUTING "${backend_drop_rule[@]}"
     done
   fi
 }
@@ -278,11 +268,13 @@ manage_family() {
 case "${1:-}" in
   start)
     manage_family start iptables
-    manage_family start ip6tables
+    if [[ -s /proc/net/if_inet6 ]]; then
+      manage_family start ip6tables
+    fi
     ;;
   stop)
     manage_family stop iptables
-    manage_family stop ip6tables
+    manage_family stop ip6tables || true
     ;;
   *)
     echo "用法: $0 {start|stop}" >&2
@@ -306,9 +298,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=${nginx_bin} -t -c ${NGINX_CONF} -p ${BASE_DIR}/
+ExecStartPre=${FW_HELPER} start
 ExecStart=${nginx_bin} -c ${NGINX_CONF} -p ${BASE_DIR}/ -g "daemon off;"
-ExecStartPost=${FW_HELPER} start
-ExecStopPost=${FW_HELPER} stop
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=2s
@@ -369,13 +360,14 @@ read_sni_value() {
 }
 
 read_install_values() {
-  local old_node_port old_sni input
+  local old_node_port old_proxy_port old_sni input suggested_proxy_port
 
   load_state
   old_node_port=$NODE_PORT
+  old_proxy_port=$PROXY_PORT
   old_sni=$FAKE_SNI
 
-  printf '\n请填写节点端口并选择大厂 SNI。\n\n'
+  printf '\n请填写后端端口、选择大厂 SNI 并设置 Nginx 公网端口。\n\n'
 
   while true; do
     if [[ -n $old_node_port ]]; then
@@ -389,19 +381,46 @@ read_install_values() {
   done
 
   read_sni_value "$old_sni"
+
+  if valid_port "$old_proxy_port" && [[ $old_proxy_port -ne $NODE_PORT ]]; then
+    suggested_proxy_port=$old_proxy_port
+  else
+    suggested_proxy_port=$((NODE_PORT + 1))
+    if (( suggested_proxy_port > 65535 )); then
+      suggested_proxy_port=39001
+    fi
+  fi
+
+  while true; do
+    read -r -p "请输入 Nginx 公网端口 [$suggested_proxy_port]: " input
+    PROXY_PORT=${input:-$suggested_proxy_port}
+    if ! valid_port "$PROXY_PORT"; then
+      warn "端口必须是 1 到 65535 之间的数字。"
+      continue
+    fi
+    if [[ $PROXY_PORT -eq $NODE_PORT ]]; then
+      warn "Nginx 公网端口不能与节点后端端口相同。"
+      continue
+    fi
+    if port_is_listening "$PROXY_PORT" && [[ $PROXY_PORT != "$old_proxy_port" ]]; then
+      warn "端口 $PROXY_PORT 已被其他服务占用。"
+      continue
+    fi
+    break
+  done
 }
 
 install_or_reconfigure() {
-  local module_path old_proxy_port summary_proxy
+  local module_path
 
   load_state
-  old_proxy_port=$PROXY_PORT
   read_install_values
 
   printf '\n准备应用以下配置：\n'
-  printf '  TLS 节点公网端口：%s\n' "$NODE_PORT"
+  printf '  节点后端端口：%s（仅供本机 Nginx 回连）\n' "$NODE_PORT"
+  printf '  Nginx 公网端口：%s（用户连接此端口）\n' "$PROXY_PORT"
   printf '  大厂 SNI：%s\n' "$FAKE_SNI"
-  printf '  原节点地址、端口、密码：保持不变\n'
+  printf '  节点后端配置及密码：保持不变\n'
   printf '  HTTP 申请证书及 80 端口：不修改\n\n'
   confirm "确认安装或重新配置吗？" || {
     info "操作已取消。"
@@ -424,14 +443,9 @@ install_or_reconfigure() {
   fi
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
 
-  if valid_port "$old_proxy_port" &&
-    [[ $old_proxy_port -ne $NODE_PORT ]] &&
-    ! port_is_listening "$old_proxy_port"; then
-    PROXY_PORT=$old_proxy_port
-  else
-    PROXY_PORT=$(choose_proxy_port "$NODE_PORT")
+  if port_is_listening "$PROXY_PORT"; then
+    die "Nginx 公网端口 $PROXY_PORT 仍被其他服务占用，请重新运行并选择其他端口。"
   fi
-  summary_proxy=$PROXY_PORT
 
   module_path=$(find_stream_module) || die "没有找到 Nginx Stream 模块。"
   write_state
@@ -446,13 +460,14 @@ install_or_reconfigure() {
 
   printf '\n'
   ok "安装/配置完成。"
-  printf '  公网节点端口：%s（没有改变）\n' "$NODE_PORT"
-  printf '  内部转发端口：%s（自动管理，无需填到面板）\n' "$summary_proxy"
+  printf '  节点后端端口：%s（公网已封锁）\n' "$NODE_PORT"
+  printf '  用户连接端口：%s\n' "$PROXY_PORT"
   printf '  客户端 SNI：%s\n' "$FAKE_SNI"
   printf '\n客户端或面板订阅需要修改：\n'
   printf '  1. SNI 改为 %s\n' "$FAKE_SNI"
-  printf '  2. 开启“跳过证书验证 / insecure”\n'
-  printf '  3. 节点地址、端口和密码保持原样\n'
+  printf '  2. 端口改为 %s\n' "$PROXY_PORT"
+  printf '  3. 开启“跳过证书验证 / insecure”\n'
+  printf '  4. 节点地址和密码保持原样\n'
   printf '\n'
   warn "若客户端支持证书公钥固定，建议固定公钥，不要只依赖 insecure。"
   warn "节点后端如有“拒绝未知 SNI”选项，请将其关闭。"
@@ -466,8 +481,8 @@ show_status() {
     return
   fi
 
-  printf 'TLS 节点端口：%s\n' "$NODE_PORT"
-  printf '内部转发端口：%s\n' "$PROXY_PORT"
+  printf 'TLS 后端端口：%s（禁止公网直连）\n' "$NODE_PORT"
+  printf 'Nginx 公网端口：%s（用户连接端口）\n' "$PROXY_PORT"
   printf '大厂 SNI：%s\n' "$FAKE_SNI"
 
   if systemctl is-active --quiet "$APP" 2>/dev/null; then
@@ -485,15 +500,28 @@ show_status() {
   fi
 
   if port_is_listening "$PROXY_PORT"; then
-    printf 'Nginx 内部监听：正常\n'
+    printf 'Nginx 公网监听：正常\n'
   else
-    printf 'Nginx 内部监听：异常，端口未监听\n'
+    printf 'Nginx 公网监听：异常，端口未监听\n'
   fi
 
-  if iptables -t nat -S PREROUTING 2>/dev/null | grep -q "${APP}-redirect"; then
-    printf 'IPv4 透明转发：已启用\n'
+  if iptables -S INPUT 2>/dev/null | grep -q "${APP}-front-accept"; then
+    printf 'IPv4 Nginx端口：已开放\n'
   else
-    printf 'IPv4 透明转发：未启用\n'
+    printf 'IPv4 Nginx端口：未开放\n'
+  fi
+  if iptables -t raw -S PREROUTING 2>/dev/null | grep -q "${APP}-backend-drop"; then
+    printf 'IPv4 后端端口：已封锁公网访问\n'
+  else
+    printf 'IPv4 后端端口：未封锁\n'
+  fi
+  if [[ -s /proc/net/if_inet6 ]]; then
+    if ip6tables -S INPUT 2>/dev/null | grep -q "${APP}-front-accept" &&
+      ip6tables -t raw -S PREROUTING 2>/dev/null | grep -q "${APP}-backend-drop"; then
+      printf 'IPv6 入口及后端保护：已启用\n'
+    else
+      printf 'IPv6 入口及后端保护：未完整启用\n'
+    fi
   fi
 }
 
@@ -506,7 +534,7 @@ start_service() {
 stop_service() {
   [[ -f $SERVICE_FILE ]] || die "尚未安装。"
   systemctl stop "$APP"
-  ok "服务已停止，公网端口已恢复为直接连接 TLS 后端。"
+  ok "服务已停止；原后端端口继续保持封锁，卸载后才恢复直连。"
 }
 
 restart_service() {
