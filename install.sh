@@ -169,7 +169,7 @@ write_nginx_config() {
 ${load_module}
 worker_processes auto;
 pid /run/${APP}.pid;
-error_log /var/log/${APP}.log warn;
+error_log /dev/null crit;
 
 events {
     worker_connections 4096;
@@ -286,6 +286,8 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576
+StandardOutput=null
+StandardError=null
 
 [Install]
 WantedBy=multi-user.target
@@ -344,12 +346,7 @@ read_install_values() {
   old_node_port=$NODE_PORT
   old_sni=$FAKE_SNI
 
-  printf '\n'
-  printf '需要输入的内容：\n'
-  printf '  1. AnyTLS 节点端口：面板下发、服务端当前正在监听的端口。\n'
-  printf '  2. 大厂 SNI：从 Epic、NVIDIA、AMD、Speedtest 中选择。\n'
-  printf '\n'
-  printf '节点地址、密码、Node ID、面板 API 和证书路径都不需要输入。\n\n'
+  printf '\n请填写节点端口并选择大厂 SNI。\n\n'
 
   while true; do
     if [[ -n $old_node_port ]]; then
@@ -395,6 +392,7 @@ install_or_reconfigure() {
   if [[ -x $FW_HELPER ]]; then
     "$FW_HELPER" stop >/dev/null 2>&1 || true
   fi
+  rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
 
   if valid_port "$old_proxy_port" &&
     [[ $old_proxy_port -ne $NODE_PORT ]] &&
@@ -414,7 +412,7 @@ install_or_reconfigure() {
   nginx -t -c "$NGINX_CONF" -p "$BASE_DIR/"
   systemctl daemon-reload
   systemctl enable --now "$APP"
-  systemctl is-active --quiet "$APP" || die "服务启动失败，请通过菜单查看日志。"
+  systemctl is-active --quiet "$APP" || die "服务启动失败，请运行 systemctl status ${APP} 检查状态。"
 
   printf '\n'
   ok "安装/配置完成。"
@@ -485,14 +483,6 @@ restart_service() {
   ok "服务已重启。"
 }
 
-show_logs() {
-  journalctl -u "$APP" -n 100 --no-pager 2>/dev/null || true
-  if [[ -f /var/log/${APP}.log ]]; then
-    printf '\n========== Nginx 错误日志 ==========\n'
-    tail -n 50 "/var/log/${APP}.log" || true
-  fi
-}
-
 remove_app() {
   if [[ ! -f $SERVICE_FILE && ! -d $BASE_DIR ]]; then
     info "当前没有安装。"
@@ -509,6 +499,7 @@ remove_app() {
   fi
   systemctl disable --now "$APP" >/dev/null 2>&1 || true
   rm -f "$SERVICE_FILE" "$FW_HELPER"
+  rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
   rm -rf "$BASE_DIR"
   systemctl daemon-reload
   ok "已卸载，Nginx 软件包予以保留，原 AnyTLS 节点端口已恢复直连。"
@@ -525,11 +516,10 @@ show_menu() {
     printf '  3. 启动服务\n'
     printf '  4. 停止服务\n'
     printf '  5. 重启服务\n'
-    printf '  6. 查看日志\n'
-    printf '  7. 卸载分流\n'
+    printf '  6. 卸载分流\n'
     printf '  0. 退出\n'
     printf '========================================\n'
-    read -r -p "请选择 [0-7]: " choice
+    read -r -p "请选择 [0-6]: " choice
 
     case "$choice" in
       1) install_or_reconfigure; pause_menu ;;
@@ -537,10 +527,9 @@ show_menu() {
       3) start_service; pause_menu ;;
       4) stop_service; pause_menu ;;
       5) restart_service; pause_menu ;;
-      6) show_logs; pause_menu ;;
-      7) remove_app; pause_menu ;;
+      6) remove_app; pause_menu ;;
       0) exit 0 ;;
-      *) warn "请输入 0 到 7。" ;;
+      *) warn "请输入 0 到 6。" ;;
     esac
   done
 }
@@ -553,7 +542,6 @@ case "${1:-menu}" in
   start) start_service ;;
   stop) stop_service ;;
   restart) restart_service ;;
-  logs) show_logs ;;
   remove|uninstall) remove_app ;;
   *) die "未知参数。直接运行脚本可进入中文菜单。" ;;
 esac
