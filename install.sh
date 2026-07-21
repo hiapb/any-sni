@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# AnyTLS 大厂 SNI 分流管理脚本
+# TLS 节点大厂 SNI 分流管理脚本
 set -Eeuo pipefail
 
-APP="anytls-sni"
+APP="tls-sni"
+LEGACY_APP="anytls-sni"
 BASE_DIR="/etc/${APP}"
 STATE_FILE="${BASE_DIR}/state.env"
 NGINX_CONF="${BASE_DIR}/nginx.conf"
 FW_HELPER="/usr/local/sbin/${APP}-fw"
 SERVICE_FILE="/etc/systemd/system/${APP}.service"
+LEGACY_BASE_DIR="/etc/${LEGACY_APP}"
+LEGACY_STATE_FILE="${LEGACY_BASE_DIR}/state.env"
+LEGACY_FW_HELPER="/usr/local/sbin/${LEGACY_APP}-fw"
+LEGACY_SERVICE_FILE="/etc/systemd/system/${LEGACY_APP}.service"
 
 info() {
   printf '[信息] %s\n' "$*"
@@ -53,7 +58,29 @@ load_state() {
     # 状态文件只允许 root 写入，并且值在写入前已经校验。
     # shellcheck disable=SC1090
     source "$STATE_FILE"
+  elif [[ -r $LEGACY_STATE_FILE ]]; then
+    # 读取旧版配置作为重新安装时的默认值。
+    # shellcheck disable=SC1090
+    source "$LEGACY_STATE_FILE"
   fi
+}
+
+legacy_install_exists() {
+  [[ -f $LEGACY_SERVICE_FILE || -d $LEGACY_BASE_DIR || -x $LEGACY_FW_HELPER ]]
+}
+
+cleanup_legacy_install() {
+  legacy_install_exists || return 0
+
+  if [[ -x $LEGACY_FW_HELPER ]]; then
+    "$LEGACY_FW_HELPER" stop >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now "$LEGACY_APP" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_SERVICE_FILE" "$LEGACY_FW_HELPER"
+  rm -f "/var/log/${LEGACY_APP}.log" "/run/${LEGACY_APP}.pid"
+  rm -rf "$LEGACY_BASE_DIR"
+  systemctl daemon-reload
+  info "已清理旧版 ${LEGACY_APP} 配置。"
 }
 
 confirm() {
@@ -177,11 +204,11 @@ events {
 
 stream {
     map \$ssl_preread_server_name \$selected_backend {
-        "${FAKE_SNI}" anytls_backend;
+        "${FAKE_SNI}" tls_backend;
         default       cover_backend;
     }
 
-    upstream anytls_backend {
+    upstream tls_backend {
         server 127.0.0.1:${NODE_PORT};
     }
 
@@ -208,7 +235,7 @@ write_firewall_helper() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP="anytls-sni"
+APP="tls-sni"
 STATE_FILE="/etc/${APP}/state.env"
 [[ -r $STATE_FILE ]] || exit 0
 # shellcheck disable=SC1090
@@ -272,7 +299,7 @@ write_service() {
 
   cat >"$SERVICE_FILE" <<EOF
 [Unit]
-Description=AnyTLS SNI 分流服务
+Description=TLS 节点 SNI 分流服务
 After=network-online.target firewalld.service nftables.service
 Wants=network-online.target
 
@@ -350,10 +377,10 @@ read_install_values() {
 
   while true; do
     if [[ -n $old_node_port ]]; then
-      read -r -p "请输入 AnyTLS 节点端口 [$old_node_port]: " input
+      read -r -p "请输入 TLS 节点端口 [$old_node_port]: " input
       NODE_PORT=${input:-$old_node_port}
     else
-      read -r -p "请输入 AnyTLS 节点端口: " NODE_PORT
+      read -r -p "请输入 TLS 节点端口: " NODE_PORT
     fi
     valid_port "$NODE_PORT" && break
     warn "端口必须是 1 到 65535 之间的数字。"
@@ -370,7 +397,7 @@ install_or_reconfigure() {
   read_install_values
 
   printf '\n准备应用以下配置：\n'
-  printf '  AnyTLS 公网端口：%s\n' "$NODE_PORT"
+  printf '  TLS 节点公网端口：%s\n' "$NODE_PORT"
   printf '  大厂 SNI：%s\n' "$FAKE_SNI"
   printf '  原节点地址、端口、密码：保持不变\n'
   printf '  HTTP 申请证书及 80 端口：不修改\n\n'
@@ -382,10 +409,11 @@ install_or_reconfigure() {
   install_dependencies
 
   if ! port_is_listening "$NODE_PORT"; then
-    die "TCP 端口 $NODE_PORT 没有服务监听。请先确认面板节点已对接成功且 AnyTLS 正常运行。"
+    die "TCP 端口 $NODE_PORT 没有服务监听。请先确认面板节点已对接成功且 TLS 节点正常运行。"
   fi
 
   # 先撤销旧转发，保证重新配置时不会残留规则或占用内部端口。
+  cleanup_legacy_install
   if systemctl is-active --quiet "$APP" 2>/dev/null; then
     systemctl stop "$APP"
   fi
@@ -436,20 +464,22 @@ show_status() {
     return
   fi
 
-  printf 'AnyTLS 节点端口：%s\n' "$NODE_PORT"
+  printf 'TLS 节点端口：%s\n' "$NODE_PORT"
   printf '内部转发端口：%s\n' "$PROXY_PORT"
   printf '大厂 SNI：%s\n' "$FAKE_SNI"
 
   if systemctl is-active --quiet "$APP" 2>/dev/null; then
     printf '分流服务：运行中\n'
+  elif systemctl is-active --quiet "$LEGACY_APP" 2>/dev/null; then
+    printf '分流服务：旧版正在运行，请选择“安装 / 重新配置”完成迁移\n'
   else
     printf '分流服务：未运行\n'
   fi
 
   if port_is_listening "$NODE_PORT"; then
-    printf 'AnyTLS 后端监听：正常\n'
+    printf 'TLS 后端监听：正常\n'
   else
-    printf 'AnyTLS 后端监听：异常，端口未监听\n'
+    printf 'TLS 后端监听：异常，端口未监听\n'
   fi
 
   if port_is_listening "$PROXY_PORT"; then
@@ -474,7 +504,7 @@ start_service() {
 stop_service() {
   [[ -f $SERVICE_FILE ]] || die "尚未安装。"
   systemctl stop "$APP"
-  ok "服务已停止，公网端口已恢复为直接连接 AnyTLS 后端。"
+  ok "服务已停止，公网端口已恢复为直接连接 TLS 后端。"
 }
 
 restart_service() {
@@ -484,16 +514,17 @@ restart_service() {
 }
 
 remove_app() {
-  if [[ ! -f $SERVICE_FILE && ! -d $BASE_DIR ]]; then
+  if [[ ! -f $SERVICE_FILE && ! -d $BASE_DIR ]] && ! legacy_install_exists; then
     info "当前没有安装。"
     return
   fi
 
-  confirm "确认卸载 SNI 分流吗？卸载后 AnyTLS 将恢复直接连接。" || {
+  confirm "确认卸载 SNI 分流吗？卸载后 TLS 节点将恢复直接连接。" || {
     info "操作已取消。"
     return
   }
 
+  cleanup_legacy_install
   if [[ -x $FW_HELPER ]]; then
     "$FW_HELPER" stop || true
   fi
@@ -502,14 +533,14 @@ remove_app() {
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
   rm -rf "$BASE_DIR"
   systemctl daemon-reload
-  ok "已卸载，Nginx 软件包予以保留，原 AnyTLS 节点端口已恢复直连。"
+  ok "已卸载，Nginx 软件包予以保留，原 TLS 节点端口已恢复直连。"
 }
 
 show_menu() {
   while true; do
     printf '\n'
     printf '========================================\n'
-    printf '       AnyTLS 大厂 SNI 分流管理\n'
+    printf '       TLS 节点大厂 SNI 分流管理\n'
     printf '========================================\n'
     printf '  1. 安装 / 重新配置\n'
     printf '  2. 查看运行状态\n'
