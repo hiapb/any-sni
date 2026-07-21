@@ -9,6 +9,8 @@ STATE_FILE="${BASE_DIR}/state.env"
 NGINX_CONF="${BASE_DIR}/nginx.conf"
 FW_HELPER="/usr/local/sbin/${APP}-fw"
 SERVICE_FILE="/etc/systemd/system/${APP}.service"
+LOG_DIR="/var/log/${APP}"
+LOGROTATE_FILE="/etc/logrotate.d/${APP}"
 LEGACY_BASE_DIR="/etc/${LEGACY_APP}"
 LEGACY_STATE_FILE="${LEGACY_BASE_DIR}/state.env"
 LEGACY_FW_HELPER="/usr/local/sbin/${LEGACY_APP}-fw"
@@ -119,6 +121,7 @@ install_dependencies() {
   if command -v nginx >/dev/null 2>&1 &&
     command -v iptables >/dev/null 2>&1 &&
     command -v ss >/dev/null 2>&1 &&
+    command -v logrotate >/dev/null 2>&1 &&
     find_stream_module >/dev/null 2>&1; then
     info "所需组件已经安装。"
     return
@@ -130,11 +133,11 @@ install_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y nginx libnginx-mod-stream iptables iproute2
+    apt-get install -y nginx libnginx-mod-stream iptables iproute2 logrotate
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y nginx nginx-mod-stream iptables iproute
+    dnf install -y nginx nginx-mod-stream iptables iproute logrotate
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y nginx nginx-mod-stream iptables iproute
+    yum install -y nginx nginx-mod-stream iptables iproute logrotate
   else
     die "仅支持 apt、dnf 或 yum 软件包管理器。"
   fi
@@ -148,6 +151,7 @@ install_dependencies() {
   command -v nginx >/dev/null 2>&1 || die "Nginx 安装失败。"
   command -v iptables >/dev/null 2>&1 || die "iptables 安装失败。"
   command -v ss >/dev/null 2>&1 || die "iproute2 安装失败。"
+  command -v logrotate >/dev/null 2>&1 || die "logrotate 安装失败。"
   find_stream_module >/dev/null 2>&1 || die "没有找到 Nginx Stream 模块。"
 }
 
@@ -179,7 +183,7 @@ write_nginx_config() {
 ${load_module}
 worker_processes auto;
 pid /run/${APP}.pid;
-error_log /dev/null crit;
+error_log ${LOG_DIR}/error.log warn;
 
 events {
     worker_connections 1024;
@@ -190,6 +194,9 @@ stream {
         "${FAKE_SNI}" tls_backend;
         default       cover_backend;
     }
+
+    log_format sni_route '\$time_iso8601 client=\$remote_addr:\$remote_port sni="\$ssl_preread_server_name" route=\$selected_backend status=\$status sent=\$bytes_sent received=\$bytes_received time=\$session_time';
+    access_log ${LOG_DIR}/access.log sni_route;
 
     upstream tls_backend {
         server 127.0.0.1:${NODE_PORT};
@@ -209,6 +216,21 @@ ${ipv6_listen}
         proxy_timeout 1h;
         tcp_nodelay on;
     }
+}
+EOF
+}
+
+write_logrotate_config() {
+  mkdir -p "$LOG_DIR"
+  chmod 0755 "$LOG_DIR"
+  cat >"$LOGROTATE_FILE" <<EOF
+${LOG_DIR}/*.log {
+    daily
+    rotate 0
+    missingok
+    notifempty
+    copytruncate
+    su root root
 }
 EOF
 }
@@ -449,6 +471,7 @@ install_or_reconfigure() {
 
   module_path=$(find_stream_module) || die "没有找到 Nginx Stream 模块。"
   write_state
+  write_logrotate_config
   write_nginx_config "$module_path"
   write_firewall_helper
   write_service
@@ -471,6 +494,7 @@ install_or_reconfigure() {
   printf '\n'
   warn "若客户端支持证书公钥固定，建议固定公钥，不要只依赖 insecure。"
   warn "节点后端如有“拒绝未知 SNI”选项，请将其关闭。"
+  warn "请确认云厂商安全组已经放行 TCP ${PROXY_PORT}，主机防火墙无法代替云安全组。"
 }
 
 show_status() {
@@ -543,6 +567,25 @@ restart_service() {
   ok "服务已重启。"
 }
 
+show_logs() {
+  printf '\n========== 服务状态 ==========\n'
+  systemctl --no-pager --full status "$APP" 2>/dev/null || true
+
+  printf '\n========== 最近 SNI 路由 ==========\n'
+  if [[ -f ${LOG_DIR}/access.log ]]; then
+    tail -n 100 "${LOG_DIR}/access.log"
+  else
+    printf '暂无访问日志。\n'
+  fi
+
+  printf '\n========== 最近错误 ==========\n'
+  if [[ -f ${LOG_DIR}/error.log ]]; then
+    tail -n 100 "${LOG_DIR}/error.log"
+  else
+    printf '暂无错误日志。\n'
+  fi
+}
+
 remove_app() {
   if [[ ! -f $SERVICE_FILE && ! -d $BASE_DIR ]] && ! legacy_install_exists; then
     info "当前没有安装。"
@@ -561,6 +604,8 @@ remove_app() {
   systemctl disable --now "$APP" >/dev/null 2>&1 || true
   rm -f "$SERVICE_FILE" "$FW_HELPER"
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
+  rm -f "$LOGROTATE_FILE"
+  rm -rf "$LOG_DIR"
   rm -rf "$BASE_DIR"
   systemctl daemon-reload
   ok "已卸载，Nginx 软件包予以保留，原 TLS 节点端口已恢复直连。"
@@ -577,10 +622,11 @@ show_menu() {
     printf '  3. 启动服务\n'
     printf '  4. 停止服务\n'
     printf '  5. 重启服务\n'
-    printf '  6. 卸载分流\n'
+    printf '  6. 查看日志\n'
+    printf '  7. 卸载分流\n'
     printf '  0. 退出\n'
     printf '========================================\n'
-    read -r -p "请选择 [0-6]: " choice
+    read -r -p "请选择 [0-7]: " choice
 
     case "$choice" in
       1) install_or_reconfigure; pause_menu ;;
@@ -588,9 +634,10 @@ show_menu() {
       3) start_service; pause_menu ;;
       4) stop_service; pause_menu ;;
       5) restart_service; pause_menu ;;
-      6) remove_app; pause_menu ;;
+      6) show_logs; pause_menu ;;
+      7) remove_app; pause_menu ;;
       0) exit 0 ;;
-      *) warn "请输入 0 到 6。" ;;
+      *) warn "请输入 0 到 7。" ;;
     esac
   done
 }
@@ -603,6 +650,7 @@ case "${1:-menu}" in
   start) start_service ;;
   stop) stop_service ;;
   restart) restart_service ;;
+  logs) show_logs ;;
   remove|uninstall) remove_app ;;
   *) die "未知参数。直接运行脚本可进入中文菜单。" ;;
 esac
