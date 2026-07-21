@@ -267,6 +267,7 @@ manage_family() {
     -j ACCEPT
   )
   local -a backend_drop_rule=(
+    ! -i lo
     -p tcp --dport "$NODE_PORT"
     -m comment --comment "${APP}-backend-drop"
     -j DROP
