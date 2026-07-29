@@ -6,7 +6,6 @@ APP="tls-sni"
 LEGACY_APP="anytls-sni"
 BASE_DIR="/etc/${APP}"
 STATE_FILE="${BASE_DIR}/state.env"
-SALAMANDER_KEY_FILE="${BASE_DIR}/salamander.key"
 NGINX_CONF="${BASE_DIR}/nginx.conf"
 FW_HELPER="/usr/local/sbin/${APP}-fw"
 SERVICE_FILE="/etc/systemd/system/${APP}.service"
@@ -14,11 +13,23 @@ QUIC_APP="${APP}-quic"
 QUIC_FILTER_BIN="/usr/local/bin/${QUIC_APP}"
 QUIC_FILTER_SERVICE_FILE="/etc/systemd/system/${QUIC_APP}.service"
 QUIC_FILTER_SOURCE_DIR="/usr/local/src/${QUIC_APP}"
-GO_TOOLCHAIN_ROOT="/opt/${APP}-go/1.23.4"
+GO_VERSION="1.26.5"
+GO_TOOLCHAIN_ROOT="/opt/${APP}-go/${GO_VERSION}"
 CACHE_DIR="/var/cache/${APP}"
 LOG_DIR="/var/log/${APP}"
 LOGROTATE_FILE="/etc/logrotate.d/${APP}"
 GO_BIN=""
+XBOARD_SERVICE="xboard-node.service"
+XBOARD_COMMIT="0a29338e1f102a462363ce3527417029f89bab28"
+XBOARD_ARCHIVE_SHA256="fe7ca4d44e0a30d01b74d01ce9e0025d5656bb0fd63dbe1634d5710404c59f90"
+SINGBOX_COMMIT="2e665cb7e295949ba7c5536f9b7754f94ab78cee"
+SINGBOX_ARCHIVE_SHA256="dbd9776319bba3bab9543c384b1558ecac43d590650d6ef179a85bd0d45282d5"
+XBOARD_SOURCE_DIR="/usr/local/src/${APP}-xboard-node"
+SINGBOX_SOURCE_DIR="/usr/local/src/${APP}-sing-box"
+XBOARD_BACKUP_BIN="${BASE_DIR}/xboard-node.original"
+XBOARD_PATCH_STATE="${BASE_DIR}/xboard-patch.env"
+XBOARD_DROPIN_DIR="/etc/systemd/system/${XBOARD_SERVICE}.d"
+XBOARD_DROPIN_FILE="${XBOARD_DROPIN_DIR}/${APP}.conf"
 LEGACY_BASE_DIR="/etc/${LEGACY_APP}"
 LEGACY_STATE_FILE="${LEGACY_BASE_DIR}/state.env"
 LEGACY_FW_HELPER="/usr/local/sbin/${LEGACY_APP}-fw"
@@ -93,7 +104,7 @@ load_state() {
   PROXY_PORT=""
   FAKE_SNI=""
   UDP_MODE="none"
-  QUIC_FILTER_PORT=""
+  XBOARD_BIN_PATH=""
   if [[ -r $STATE_FILE ]]; then
     # 状态文件只允许 root 写入，并且值在写入前已经校验。
     # shellcheck disable=SC1090
@@ -103,6 +114,9 @@ load_state() {
     # shellcheck disable=SC1090
     source "$LEGACY_STATE_FILE"
   fi
+  case "${UDP_MODE:-none}" in
+    plain|salamander) UDP_MODE="kernel" ;;
+  esac
 }
 
 go_version_ok() {
@@ -111,7 +125,7 @@ go_version_ok() {
   version=$("$go_cmd" version 2>/dev/null) || return 1
   [[ $version =~ go1\.([0-9]+) ]] || return 1
   minor=${BASH_REMATCH[1]}
-  (( minor >= 22 ))
+  (( minor >= 26 ))
 }
 
 ensure_go() {
@@ -127,18 +141,18 @@ ensure_go() {
 
   local arch archive checksum url tmp_dir
   case "$(uname -m)" in
-    x86_64|amd64) arch=amd64; checksum=6924efde5de86fe277676e929dc9917d466efa02fb934197bc2eba35d5680971 ;;
-    aarch64|arm64) arch=arm64; checksum=16e5017863a7f6071363782b1b8042eb12c6ca4f4cd71528b2123f0a1275b13e ;;
-    *) die "UDP/HY2 模式需要 Go 1.22+，当前架构无法自动安装 Go 工具链。" ;;
+    x86_64|amd64) arch=amd64; checksum=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053 ;;
+    aarch64|arm64) arch=arm64; checksum=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49 ;;
+    *) die "HY2 内核 SNI 模式仅支持 amd64 和 arm64。" ;;
   esac
   command -v curl >/dev/null 2>&1 || die "缺少 curl，无法下载 Go 工具链。"
   command -v sha256sum >/dev/null 2>&1 || die "缺少 sha256sum，无法校验 Go 工具链。"
   command -v tar >/dev/null 2>&1 || die "缺少 tar，无法解压 Go 工具链。"
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT
-  archive="$tmp_dir/go1.23.4.linux-${arch}.tar.gz"
-  url="https://dl.google.com/go/go1.23.4.linux-${arch}.tar.gz"
-  info "正在安装 Go 1.23.4（仅用于构建 UDP 过滤器）..."
+  archive="$tmp_dir/go${GO_VERSION}.linux-${arch}.tar.gz"
+  url="https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz"
+  info "正在安装 Go ${GO_VERSION}（仅用于构建补丁版 xboard-node）..."
   curl -fL --retry 3 -o "$archive" "$url"
   printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c - >/dev/null
   rm -rf "$GO_TOOLCHAIN_ROOT"
@@ -214,11 +228,11 @@ install_dependencies() {
   command -v ss >/dev/null 2>&1 || packages_needed=1
   command -v logrotate >/dev/null 2>&1 || packages_needed=1
   find_stream_module >/dev/null 2>&1 || packages_needed=1
-  if [[ $UDP_MODE != none ]] &&
-    ! go_version_ok go && ! go_version_ok "${GO_TOOLCHAIN_ROOT}/bin/go"; then
+  if [[ $UDP_MODE != none ]]; then
     command -v curl >/dev/null 2>&1 || packages_needed=1
     command -v sha256sum >/dev/null 2>&1 || packages_needed=1
     command -v tar >/dev/null 2>&1 || packages_needed=1
+    command -v patch >/dev/null 2>&1 || packages_needed=1
   fi
 
   if (( packages_needed == 0 )); then
@@ -228,16 +242,16 @@ install_dependencies() {
   fi
 
   systemctl is-active --quiet nginx 2>/dev/null && nginx_was_active=1
-  info "正在安装 Nginx Stream、iptables 和网络工具..."
+  info "正在安装 Nginx Stream、构建工具和网络组件..."
 
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y nginx libnginx-mod-stream iptables iproute2 logrotate curl ca-certificates tar coreutils
+    apt-get install -y nginx libnginx-mod-stream iptables iproute2 logrotate curl ca-certificates tar coreutils patch
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y nginx nginx-mod-stream iptables iproute logrotate curl ca-certificates tar coreutils
+    dnf install -y nginx nginx-mod-stream iptables iproute logrotate curl ca-certificates tar coreutils patch
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y nginx nginx-mod-stream iptables iproute logrotate curl ca-certificates tar coreutils
+    yum install -y nginx nginx-mod-stream iptables iproute logrotate curl ca-certificates tar coreutils patch
   else
     die "仅支持 apt、dnf 或 yum 软件包管理器。"
   fi
@@ -252,7 +266,10 @@ install_dependencies() {
   command -v iptables >/dev/null 2>&1 || die "iptables 安装失败。"
   command -v ss >/dev/null 2>&1 || die "iproute2 安装失败。"
   command -v logrotate >/dev/null 2>&1 || die "logrotate 安装失败。"
-  [[ $UDP_MODE == none ]] || ensure_go
+  if [[ $UDP_MODE != none ]]; then
+    command -v patch >/dev/null 2>&1 || die "patch 安装失败。"
+    ensure_go
+  fi
   find_stream_module >/dev/null 2>&1 || die "没有找到 Nginx Stream 模块。"
 }
 
@@ -264,227 +281,392 @@ NODE_PORT=$NODE_PORT
 PROXY_PORT=$PROXY_PORT
 FAKE_SNI=$FAKE_SNI
 UDP_MODE=$UDP_MODE
-QUIC_FILTER_PORT=$QUIC_FILTER_PORT
+XBOARD_BIN_PATH=${XBOARD_BIN_PATH:-}
 EOF
   chmod 0600 "$STATE_FILE"
-  if [[ $UDP_MODE == salamander ]]; then
-    [[ -s $SALAMANDER_KEY_FILE ]] || die "Salamander 密码文件不存在。"
-    chmod 0600 "$SALAMANDER_KEY_FILE"
-  else
-    rm -f "$SALAMANDER_KEY_FILE"
+}
+
+find_xboard_binary() {
+  local candidate pid
+  if [[ -n ${XBOARD_BIN_PATH:-} && -x $XBOARD_BIN_PATH ]]; then
+    printf '%s\n' "$XBOARD_BIN_PATH"
+    return 0
   fi
-}
-
-write_salamander_key() {
-  local first second
-  while true; do
-    read -r -p "请输入节点的 Salamander 密码: " first
-    [[ ${#first} -ge 4 ]] || { warn "Salamander 密码至少 4 个字符。"; continue; }
-    read -r -p "请再次输入 Salamander 密码: " second
-    [[ $first == "$second" ]] || { warn "两次密码不一致，请重试。"; continue; }
-    SALAMANDER_NEW_PASSWORD=$first
-    return
+  pid=$(systemctl show --property MainPID --value "$XBOARD_SERVICE" 2>/dev/null || true)
+  if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+    candidate=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)
+    if [[ -n $candidate && -x $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  for candidate in \
+    /usr/local/bin/xboard-node \
+    /usr/bin/xboard-node \
+    /usr/local/xboard-node/xboard-node \
+    /opt/xboard-node/xboard-node; do
+    if [[ -x $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
   done
+  candidate=$(command -v xboard-node 2>/dev/null || true)
+  if [[ -n $candidate && -x $candidate ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
 }
 
-save_salamander_key() {
-  [[ $UDP_MODE == salamander && -n ${SALAMANDER_NEW_PASSWORD:-} ]] || return 0
-  umask 077
-  mkdir -p "$BASE_DIR"
-  printf '%s' "$SALAMANDER_NEW_PASSWORD" >"$SALAMANDER_KEY_FILE"
-  chmod 0600 "$SALAMANDER_KEY_FILE"
-  SALAMANDER_NEW_PASSWORD=""
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
 }
 
-write_quic_filter_source() {
-  mkdir -p "$QUIC_FILTER_SOURCE_DIR"
-  cat >"$QUIC_FILTER_SOURCE_DIR/go.mod" <<'EOF'
-module tls-sni-quic
-
-go 1.22
-
-require (
-  github.com/cuonglm/quicsni v0.0.0-20241227084737-7044966074df
-  golang.org/x/crypto v0.31.0
-)
-EOF
-  cat >"$QUIC_FILTER_SOURCE_DIR/main.go" <<'EOF'
-package main
-
-import (
-  "flag"
-  "fmt"
-  "log"
-  "net"
-  "os"
-  "strings"
-  "sync"
-  "time"
-
-  "github.com/cuonglm/quicsni"
-  "golang.org/x/crypto/blake2b"
-)
-
-type session struct {
-  client *net.UDPAddr
-  backend *net.UDPConn
-  last time.Time
+download_source_archive() {
+  local name=$1 url=$2 checksum=$3 destination=$4 archive=$5
+  info "正在下载固定版本的 ${name} 源码..."
+  curl -fL --retry 3 --connect-timeout 15 -o "$archive" "$url"
+  printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c - >/dev/null ||
+    die "${name} 源码校验失败。"
+  rm -rf "$destination"
+  mkdir -p "$destination"
+  tar -xzf "$archive" -C "$destination" --strip-components=1
 }
 
-func salamanderDecode(packet, psk []byte) []byte {
-  if len(packet) <= 8 { return nil }
-  h := blake2b.Sum256(append(append([]byte{}, psk...), packet[:8]...))
-  out := make([]byte, len(packet)-8)
-  for i, b := range packet[8:] { out[i] = b ^ h[i%len(h)] }
-  return out
+write_xboard_source_patches() {
+  local patch_dir=$1
+  cat >"${patch_dir}/sing-box-sni-guard.patch" <<'PATCH'
+--- a/option/tls.go
++++ b/option/tls.go
+@@ -12,6 +12,7 @@
+ type InboundTLSOptions struct {
+ 	Enabled                          bool                                `json:"enabled,omitempty"`
+ 	ServerName                       string                              `json:"server_name,omitempty"`
++	StrictServerName                 bool                                `json:"strict_server_name,omitempty"`
+ 	Insecure                         bool                                `json:"insecure,omitempty"`
+ 	ALPN                             badoption.Listable[string]          `json:"alpn,omitempty"`
+ 	MinVersion                       string                              `json:"min_version,omitempty"`
+--- a/common/tls/std_server.go
++++ b/common/tls/std_server.go
+@@ -369,6 +369,16 @@
+ 		echKeyPath:            echKeyPath,
+ 	}
+ 	serverConfig.config.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
++		if options.StrictServerName {
++			expectedServerName := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(options.ServerName)), ".")
++			clientServerName := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(info.ServerName)), ".")
++			if expectedServerName == "" {
++				return nil, E.New("tls: strict_server_name requires server_name")
++			}
++			if clientServerName != expectedServerName {
++				return nil, E.New("tls: rejected client SNI")
++			}
++		}
+ 		serverConfig.access.Lock()
+ 		defer serverConfig.access.Unlock()
+ 		return serverConfig.config, nil
+--- /dev/null
++++ b/common/tls/strict_server_name_test.go
+@@ -0,0 +1,36 @@
++package tls
++
++import (
++	"context"
++	stdTLS "crypto/tls"
++	"testing"
++
++	boxLog "github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++)
++
++func TestStrictServerName(t *testing.T) {
++	serverConfig, err := NewSTDServer(context.Background(), boxLog.NewNOPFactory().Logger(), option.InboundTLSOptions{
++		Enabled:          true,
++		ServerName:       "www.itunes.com",
++		StrictServerName: true,
++		Insecure:         true,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	stdConfig, err := serverConfig.STDConfig()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, serverName := range []string{"www.itunes.com", "WWW.ITUNES.COM."} {
++		if _, err = stdConfig.GetConfigForClient(&stdTLS.ClientHelloInfo{ServerName: serverName}); err != nil {
++			t.Fatalf("expected %q to pass: %v", serverName, err)
++		}
++	}
++	for _, serverName := range []string{"", "mtth.mm1998.com"} {
++		if _, err = stdConfig.GetConfigForClient(&stdTLS.ClientHelloInfo{ServerName: serverName}); err == nil {
++			t.Fatalf("expected %q to be rejected", serverName)
++		}
++	}
++}
+PATCH
+
+  cat >"${patch_dir}/xboard-node-sni-guard.patch" <<'PATCH'
+--- a/internal/kernel/singbox/config.go
++++ b/internal/kernel/singbox/config.go
+@@ -4,6 +4,7 @@
+ 	"encoding/base64"
+ 	"fmt"
+ 	"net"
++	"os"
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
+@@ -678,6 +679,13 @@
+ 	if tls == nil {
+ 		nlog.Core().Warn("hysteria requires TLS certificate files on disk; configure cert_mode (self, file, http, dns, or content). Sing-box will not start this inbound without tls.")
+ 		return base
++	}
++	if nc.Version == 2 {
++		guardedServerName := strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD"))
++		if guardedServerName != "" {
++			tls["server_name"] = guardedServerName
++			tls["strict_server_name"] = true
++		}
+ 	}
+ 	// Hysteria/Hysteria2 uses QUIC and requires ALPN; default to h3 if not set.
+ 	if _, ok := tls["alpn"]; !ok {
+--- a/internal/kernel/singbox/config_test.go
++++ b/internal/kernel/singbox/config_test.go
+@@ -338,6 +338,19 @@
+ 	assertMapValue(t, tls, "enabled", true)
+ }
+ 
++func TestBuildInbound_Hysteria2_WithSNIGuard(t *testing.T) {
++	t.Setenv("XBOARD_HYSTERIA2_SNI_GUARD", "www.itunes.com")
++	nc := &panel.NodeConfig{
++		Protocol:   "hysteria",
++		ServerPort: 444,
++		Version:    2,
++	}
++	inbound := buildInbound(testNodeSpec(nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
++	tls := inbound["tls"].(M)
++	assertMapValue(t, tls, "server_name", "www.itunes.com")
++	assertMapValue(t, tls, "strict_server_name", true)
++}
++
+ func TestBuildInbound_Hysteria2_WithObfs(t *testing.T) {
+ 	nc := &panel.NodeConfig{
+ 		Protocol:     "hysteria",
+PATCH
+  chmod 0600 "${patch_dir}"/*.patch
 }
 
-func packetSNI(packet []byte, psk []byte, salamander bool) (serverName string, ok bool) {
-  defer func() {
-    if recover() != nil {
-      serverName, ok = "", false
-    }
-  }()
-  if salamander { packet = salamanderDecode(packet, psk) }
-  if len(packet) == 0 { return "", false }
-  hdr, offset, err := quicsni.ParseInitialHeader(packet)
-  if err != nil || hdr == nil || offset < 0 || hdr.Length < 0 ||
-    offset > int64(len(packet)) || hdr.Length > int64(len(packet))-offset {
-    return "", false
-  }
-  hello, err := quicsni.ReadClientHello(packet)
-  if err != nil || hello == nil { return "", false }
-  return strings.TrimSpace(hello.ServerName), true
-}
-
-func main() {
-  listen := flag.String("listen", "127.0.0.1:39001", "UDP listener")
-  backendAddr := flag.String("backend", "127.0.0.1:8445", "HY2 backend")
-  expected := flag.String("sni", "", "expected SNI")
-  mode := flag.String("mode", "plain", "plain or salamander")
-  keyFile := flag.String("key", "", "Salamander key file")
-  logFile := flag.String("log", "", "log file")
-  flag.Parse()
-  if *expected == "" { log.Fatal("missing expected SNI") }
-  if *logFile != "" {
-    f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-    if err != nil { log.Fatal(err) }
-    defer f.Close()
-    log.SetOutput(f)
-  }
-  var psk []byte
-  salamander := *mode == "salamander"
-  if salamander {
-    var err error
-    psk, err = os.ReadFile(*keyFile)
-    if err != nil || len(psk) < 4 { log.Fatal("invalid Salamander key") }
-    if len(psk) > 0 && psk[len(psk)-1] == '\n' { psk = psk[:len(psk)-1] }
-    if len(psk) < 4 { log.Fatal("invalid Salamander key") }
-  }
-  listener, err := net.ListenUDP("udp", mustResolve(*listen))
-  if err != nil { log.Fatal(err) }
-  defer listener.Close()
-  log.Printf("listening=%s backend=%s sni=%s mode=%s", *listen, *backendAddr, *expected, *mode)
-  var mu sync.Mutex
-  sessions := make(map[string]*session)
-  go func() {
-    ticker := time.NewTicker(10 * time.Second)
-    defer ticker.Stop()
-    for range ticker.C {
-      now := time.Now(); mu.Lock()
-      for k, s := range sessions { if now.Sub(s.last) > 90*time.Second { s.backend.Close(); delete(sessions, k) } }
-      mu.Unlock()
-    }
-  }()
-  buf := make([]byte, 64*1024)
-  for {
-    n, addr, err := listener.ReadFromUDP(buf)
-    if err != nil { if ne, ok := err.(net.Error); ok && ne.Temporary() { continue }; log.Fatal(err) }
-    key := addr.String()
-    mu.Lock(); s := sessions[key]; mu.Unlock()
-    if s == nil {
-      // quicsni 会改写输入缓冲区；使用副本解析，原始包仍原样交给 HY2。
-      packet := append([]byte(nil), buf[:n]...)
-      seenSNI, isInitial := packetSNI(packet, psk, salamander)
-      if !isInitial || !strings.EqualFold(seenSNI, *expected) { continue }
-      remote, err := net.ResolveUDPAddr("udp", *backendAddr); if err != nil { log.Printf("resolve backend: %v", err); continue }
-      conn, err := net.DialUDP("udp", nil, remote); if err != nil { log.Printf("dial backend: %v", err); continue }
-      s = &session{client: addr, backend: conn, last: time.Now()}
-      mu.Lock(); sessions[key] = s; mu.Unlock()
-      log.Printf("allow client=%s sni=%q mode=%s", addr, *expected, *mode)
-      go func(k string, ss *session) {
-        defer ss.backend.Close()
-        rb := make([]byte, 64*1024)
-        for {
-          ss.backend.SetReadDeadline(time.Now().Add(2 * time.Minute))
-          rn, err := ss.backend.Read(rb); if err != nil { mu.Lock(); if sessions[k] == ss { delete(sessions, k) }; mu.Unlock(); return }
-          if _, err = listener.WriteToUDP(rb[:rn], ss.client); err != nil { mu.Lock(); if sessions[k] == ss { delete(sessions, k) }; mu.Unlock(); return }
-        }
-      }(key, s)
-    }
-    mu.Lock(); s.last = time.Now(); mu.Unlock()
-    if _, err := s.backend.Write(buf[:n]); err != nil { mu.Lock(); if sessions[key] == s { delete(sessions, key) }; mu.Unlock(); s.backend.Close() }
-  }
-}
-
-func mustResolve(addr string) *net.UDPAddr {
-  a, err := net.ResolveUDPAddr("udp", addr); if err != nil { panic(fmt.Sprintf("invalid listen address: %v", err)) }; return a
-}
-
-EOF
-}
-
-build_quic_filter() {
-  [[ $UDP_MODE != none ]] || return 0
+build_patched_xboard() {
+  local tmp_dir xboard_archive singbox_archive output
+  local GOPROXY=${GOPROXY:-}
+  if [[ -z $GOPROXY ]]; then
+    GOPROXY='https://proxy.golang.org|https://goproxy.cn|direct'
+  fi
+  export GOPROXY
   ensure_go
-  write_quic_filter_source
+  command -v patch >/dev/null 2>&1 || die "缺少 patch，无法应用 xboard-node 内核补丁。"
+  systemctl cat "$XBOARD_SERVICE" >/dev/null 2>&1 ||
+    die "没有找到 ${XBOARD_SERVICE}，请先安装并对接 xboard-node。"
+
+  tmp_dir=$(mktemp -d)
+  xboard_archive="${tmp_dir}/xboard-node.tar.gz"
+  singbox_archive="${tmp_dir}/sing-box.tar.gz"
+  write_xboard_source_patches "$tmp_dir"
+
+  download_source_archive \
+    "xboard-node" \
+    "https://github.com/cedar2025/Xboard-Node/archive/${XBOARD_COMMIT}.tar.gz" \
+    "$XBOARD_ARCHIVE_SHA256" \
+    "$XBOARD_SOURCE_DIR" \
+    "$xboard_archive"
+  download_source_archive \
+    "sing-box" \
+    "https://github.com/cedar2025/sing-box/archive/${SINGBOX_COMMIT}.tar.gz" \
+    "$SINGBOX_ARCHIVE_SHA256" \
+    "$SINGBOX_SOURCE_DIR" \
+    "$singbox_archive"
+
+  patch --batch --forward -d "$SINGBOX_SOURCE_DIR" -p1 <"${tmp_dir}/sing-box-sni-guard.patch"
+  patch --batch --forward -d "$XBOARD_SOURCE_DIR" -p1 <"${tmp_dir}/xboard-node-sni-guard.patch"
+
   mkdir -p "$CACHE_DIR/mod" "$CACHE_DIR/build"
-  (cd "$QUIC_FILTER_SOURCE_DIR" && \
-    GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" "$GO_BIN" mod tidy && \
-    CGO_ENABLED=0 GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" \
-      "$GO_BIN" build -trimpath -ldflags='-s -w' -o "$QUIC_FILTER_BIN" .)
-  chmod 0755 "$QUIC_FILTER_BIN"
+  (
+    cd "$SINGBOX_SOURCE_DIR"
+    CGO_ENABLED=0 GOTOOLCHAIN=local \
+      GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" \
+      "$GO_BIN" test ./common/tls
+  )
+  (
+    cd "$XBOARD_SOURCE_DIR"
+    GOTOOLCHAIN=local "$GO_BIN" mod edit \
+      -replace="github.com/sagernet/sing-box=${SINGBOX_SOURCE_DIR}"
+    CGO_ENABLED=0 GOTOOLCHAIN=local \
+      GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" \
+      "$GO_BIN" test ./internal/kernel/singbox
+    CGO_ENABLED=0 GOTOOLCHAIN=local \
+      GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" \
+      "$GO_BIN" build \
+        -trimpath \
+        -tags "with_quic with_utls with_wireguard with_acme with_clash_api" \
+        -ldflags "-s -w -X main.version=tls-sni-${XBOARD_COMMIT:0:12}" \
+        -o xboard-node.tls-sni ./cmd/xboard-node
+  )
+  output="${XBOARD_SOURCE_DIR}/xboard-node.tls-sni"
+  [[ -x $output ]] || die "补丁版 xboard-node 构建失败。"
+  "$GO_BIN" version -m "$output" >/dev/null 2>&1 || die "补丁版 xboard-node 校验失败。"
+  rm -rf "$tmp_dir"
 }
 
-write_quic_filter_service() {
-  [[ $UDP_MODE != none ]] || return 0
-  local mode_args="--mode plain"
-  [[ $UDP_MODE == salamander ]] && mode_args="--mode salamander --key ${SALAMANDER_KEY_FILE}"
-  cat >"$QUIC_FILTER_SERVICE_FILE" <<EOF
-[Unit]
-Description=TLS QUIC SNI UDP 过滤服务
-After=network-online.target
-Wants=network-online.target
-
+write_xboard_dropin() {
+  mkdir -p "$XBOARD_DROPIN_DIR"
+  cat >"$XBOARD_DROPIN_FILE" <<EOF
 [Service]
-Type=simple
-ExecStart=${QUIC_FILTER_BIN} --listen :${PROXY_PORT} --backend 127.0.0.1:${NODE_PORT} --sni ${FAKE_SNI} --log ${LOG_DIR}/quic.log ${mode_args}
-Restart=on-failure
-RestartSec=2s
-LimitNOFILE=1048576
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
+Environment=XBOARD_HYSTERIA2_SNI_GUARD=${FAKE_SNI}
 EOF
+  chmod 0644 "$XBOARD_DROPIN_FILE"
+}
+
+wait_for_xboard_udp() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if systemctl is-active --quiet "$XBOARD_SERVICE" && udp_port_is_listening "$NODE_PORT"; then
+      return 0
+    fi
+    systemctl is-failed --quiet "$XBOARD_SERVICE" && return 1
+    sleep 1
+  done
+  return 1
+}
+
+install_patched_xboard() {
+  local built_bin current_bin current_sha previous_patched_sha=""
+  local rollback_bin rollback_dropin patched_sha had_dropin=0
+  current_bin=$(find_xboard_binary) ||
+    die "没有找到 xboard-node 可执行文件。"
+  [[ $current_bin != *[[:space:]]* ]] || die "xboard-node 路径包含空白字符，无法安全处理。"
+  XBOARD_BIN_PATH=$current_bin
+
+  build_patched_xboard
+  built_bin="${XBOARD_SOURCE_DIR}/xboard-node.tls-sni"
+  mkdir -p "$BASE_DIR"
+  current_sha=$(sha256_file "$current_bin")
+  if [[ -r $XBOARD_PATCH_STATE ]]; then
+    previous_patched_sha=$(awk -F= '$1 == "PATCHED_SHA256" { print $2; exit }' "$XBOARD_PATCH_STATE")
+  fi
+  if [[ ! -s $XBOARD_BACKUP_BIN ]]; then
+    install -m 0755 "$current_bin" "$XBOARD_BACKUP_BIN"
+  elif [[ -n $previous_patched_sha && $current_sha != "$previous_patched_sha" ]]; then
+    # 节点管理程序可能已在补丁安装后升级二进制，更新恢复基线。
+    install -m 0755 "$current_bin" "$XBOARD_BACKUP_BIN"
+  fi
+
+  rollback_bin=$(mktemp)
+  install -m 0755 "$current_bin" "$rollback_bin"
+  rollback_dropin="${rollback_bin}.dropin"
+  if [[ -f $XBOARD_DROPIN_FILE ]]; then
+    cp -a "$XBOARD_DROPIN_FILE" "$rollback_dropin"
+    had_dropin=1
+  fi
+
+  write_xboard_dropin
+  systemctl stop "$XBOARD_SERVICE"
+  install -m 0755 "$built_bin" "$current_bin"
+  systemctl daemon-reload
+
+  if ! systemctl start "$XBOARD_SERVICE" || ! wait_for_xboard_udp; then
+    warn "补丁版 xboard-node 启动失败，正在自动回滚。"
+    systemctl stop "$XBOARD_SERVICE" >/dev/null 2>&1 || true
+    install -m 0755 "$rollback_bin" "$current_bin"
+    if (( had_dropin == 1 )); then
+      install -m 0644 "$rollback_dropin" "$XBOARD_DROPIN_FILE"
+    else
+      rm -f "$XBOARD_DROPIN_FILE"
+    fi
+    systemctl daemon-reload
+    systemctl start "$XBOARD_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$rollback_bin" "$rollback_dropin"
+    die "补丁版 xboard-node 未能监听 UDP ${NODE_PORT}，原二进制已经恢复。"
+  fi
+
+  rm -f "$rollback_bin" "$rollback_dropin"
+  patched_sha=$(sha256_file "$current_bin")
+  umask 077
+  cat >"$XBOARD_PATCH_STATE" <<EOF
+XBOARD_BIN_PATH=$current_bin
+PATCHED_SHA256=$patched_sha
+XBOARD_COMMIT=$XBOARD_COMMIT
+SINGBOX_COMMIT=$SINGBOX_COMMIT
+EOF
+  chmod 0600 "$XBOARD_PATCH_STATE"
+  ok "xboard-node 已替换为内核 SNI 校验版本。"
+}
+
+restore_xboard_node() {
+  local current_sha="" marker_sha="" restore_bin=""
+  if [[ -r $XBOARD_PATCH_STATE ]]; then
+    # shellcheck disable=SC1090
+    source "$XBOARD_PATCH_STATE"
+    marker_sha=${PATCHED_SHA256:-}
+    restore_bin=${XBOARD_BIN_PATH:-}
+  fi
+  if [[ -z $restore_bin ]]; then
+    restore_bin=$(find_xboard_binary 2>/dev/null || true)
+  fi
+
+  rm -f "$XBOARD_DROPIN_FILE"
+  rmdir "$XBOARD_DROPIN_DIR" >/dev/null 2>&1 || true
+  systemctl daemon-reload
+
+  if [[ -n $restore_bin && -x $restore_bin && -s $XBOARD_BACKUP_BIN ]]; then
+    current_sha=$(sha256_file "$restore_bin")
+    if [[ -z $marker_sha || $current_sha == "$marker_sha" ]]; then
+      systemctl stop "$XBOARD_SERVICE" >/dev/null 2>&1 || true
+      install -m 0755 "$XBOARD_BACKUP_BIN" "$restore_bin"
+      systemctl start "$XBOARD_SERVICE" >/dev/null 2>&1 || true
+      info "已恢复原版 xboard-node。"
+    else
+      warn "xboard-node 在安装补丁后又被修改，未覆盖当前二进制；仅移除了 SNI 环境配置。"
+      systemctl restart "$XBOARD_SERVICE" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$XBOARD_PATCH_STATE" "$XBOARD_BACKUP_BIN"
+  rm -rf "$XBOARD_SOURCE_DIR" "$SINGBOX_SOURCE_DIR"
 }
 
 write_nginx_config() {
   local module_path=$1
   local load_module=""
   local ipv6_listen=""
+  local ipv6_udp_listen=""
+  local udp_server=""
 
   if [[ -n $module_path ]]; then
     load_module="load_module ${module_path};"
   fi
   if [[ -s /proc/net/if_inet6 ]]; then
     ipv6_listen="        listen [::]:${PROXY_PORT} ipv6only=on reuseport;"
+    ipv6_udp_listen="        listen [::]:${PROXY_PORT} udp ipv6only=on reuseport;"
+  fi
+  if [[ $UDP_MODE != none ]]; then
+    udp_server=$(cat <<EOF
+    server {
+        listen 0.0.0.0:${PROXY_PORT} udp reuseport;
+${ipv6_udp_listen}
+
+        access_log ${LOG_DIR}/udp-access.log udp_route;
+        proxy_pass hy2_backend;
+        proxy_timeout 1h;
+    }
+EOF
+)
   fi
 
   mkdir -p "$BASE_DIR"
   cat >"$NGINX_CONF" <<EOF
 ${load_module}
 worker_processes auto;
+worker_rlimit_nofile 1048576;
 pid /run/${APP}.pid;
 error_log ${LOG_DIR}/error.log warn;
 
@@ -499,6 +681,7 @@ stream {
     }
 
     log_format sni_route '\$time_iso8601 client=\$remote_addr:\$remote_port sni="\$ssl_preread_server_name" route=\$selected_backend status=\$status sent=\$bytes_sent received=\$bytes_received time=\$session_time';
+    log_format udp_route '\$time_iso8601 client=\$remote_addr:\$remote_port protocol=udp route=hy2_backend status=\$status sent=\$bytes_sent received=\$bytes_received time=\$session_time';
 
     upstream tls_backend {
         server 127.0.0.1:${NODE_PORT};
@@ -506,6 +689,10 @@ stream {
 
     upstream cover_backend {
         server ${FAKE_SNI}:443;
+    }
+
+    upstream hy2_backend {
+        server 127.0.0.1:${NODE_PORT};
     }
 
     server {
@@ -519,6 +706,8 @@ ${ipv6_listen}
         proxy_timeout 1h;
         tcp_nodelay on;
     }
+
+${udp_server}
 }
 EOF
 }
@@ -637,10 +826,10 @@ EOF
 write_service() {
   local nginx_bin
   nginx_bin=$(command -v nginx)
-  local quic_dependency=""
+  local node_dependency=""
   if [[ $UDP_MODE != none ]]; then
-    quic_dependency="Requires=${QUIC_APP}.service"
-    quic_dependency+=$'\nAfter='"${QUIC_APP}.service"
+    node_dependency="After=${XBOARD_SERVICE}"
+    node_dependency+=$'\nWants='"${XBOARD_SERVICE}"
   fi
 
   cat >"$SERVICE_FILE" <<EOF
@@ -648,7 +837,7 @@ write_service() {
 Description=TLS 节点 SNI 分流服务
 After=network-online.target firewalld.service nftables.service
 Wants=network-online.target
-${quic_dependency}
+${node_dependency}
 
 [Service]
 Type=simple
@@ -720,23 +909,21 @@ read_udp_mode() {
   while true; do
     printf '\n请选择 UDP/HY2 模式：\n'
     printf '  1) 不启用 UDP\n'
-    printf '  2) HY2（无混淆）\n'
-    printf '  3) HY2（Salamander）\n'
+    printf '  2) HY2 内核 SNI 校验（兼容无混淆和 Salamander）\n'
     if [[ $old_mode == none ]]; then
       printf '  直接回车：1\n'
     else
       printf '  直接回车：保持当前模式\n'
     fi
-    read -r -p "请选择 [1-3]: " choice
+    read -r -p "请选择 [1-2]: " choice
     if [[ -z $choice && $old_mode != none ]]; then
       UDP_MODE=$old_mode
       return
     fi
     case "${choice:-1}" in
       1) UDP_MODE=none; return ;;
-      2) UDP_MODE=plain; return ;;
-      3) UDP_MODE=salamander; return ;;
-      *) warn "请输入 1 到 3。" ;;
+      2) UDP_MODE=kernel; return ;;
+      *) warn "请输入 1 或 2。" ;;
     esac
   done
 }
@@ -744,7 +931,6 @@ read_udp_mode() {
 read_install_values() {
   local old_node_port old_proxy_port old_sni old_udp_mode input suggested_proxy_port
 
-  SALAMANDER_NEW_PASSWORD=""
   load_state
   old_node_port=$NODE_PORT
   old_proxy_port=$PROXY_PORT
@@ -792,22 +978,7 @@ read_install_values() {
     fi
     break
   done
-
   read_udp_mode "$old_udp_mode"
-  if [[ $UDP_MODE == salamander ]]; then
-    if [[ -s $SALAMANDER_KEY_FILE ]]; then
-      read -r -p "请输入节点的 Salamander 密码（直接回车保留）: " input
-      if [[ -n $input ]]; then
-        local first=$input second
-        read -r -p "请再次输入 Salamander 密码: " second
-        [[ $first == "$second" ]] || die "两次 Salamander 密码不一致。"
-        [[ ${#first} -ge 4 ]] || die "Salamander 密码至少 4 个字符。"
-        SALAMANDER_NEW_PASSWORD=$first
-      fi
-    else
-      write_salamander_key
-    fi
-  fi
 }
 
 install_or_reconfigure() {
@@ -821,8 +992,7 @@ install_or_reconfigure() {
   printf '  Nginx 公网端口：%s（用户连接此端口）\n' "$PROXY_PORT"
   printf '  大厂 SNI：%s\n' "$FAKE_SNI"
   case "$UDP_MODE" in
-    plain) printf '  UDP/HY2：已启用（无混淆）\n' ;;
-    salamander) printf '  UDP/HY2：已启用（Salamander）\n' ;;
+    kernel) printf '  UDP/HY2：内核 SNI 校验（兼容 Salamander）\n' ;;
     *) printf '  UDP/HY2：未启用\n' ;;
   esac
   printf '  节点后端配置及密码：保持不变\n'
@@ -854,29 +1024,28 @@ install_or_reconfigure() {
     "$FW_HELPER" stop >/dev/null 2>&1 || true
   fi
   cleanup_quic_filter
+  rm -f "$BASE_DIR/salamander.key"
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
 
   if port_is_in_use "$PROXY_PORT"; then
     die "Nginx 公网端口 $PROXY_PORT 仍被其他服务占用，请重新运行并选择其他端口。"
   fi
-  QUIC_FILTER_PORT=""
-
   module_path=$(find_stream_module) || die "没有找到 Nginx Stream 模块。"
-  save_salamander_key
+  if [[ $UDP_MODE != none ]]; then
+    install_patched_xboard
+  elif [[ -f $XBOARD_PATCH_STATE || -f $XBOARD_DROPIN_FILE ]]; then
+    restore_xboard_node
+    XBOARD_BIN_PATH=""
+  fi
+
   write_state
   write_logrotate_config
   write_nginx_config "$module_path"
   write_firewall_helper
-  build_quic_filter
-  write_quic_filter_service
   write_service
 
   nginx -t -c "$NGINX_CONF" -p "$BASE_DIR/"
   systemctl daemon-reload
-  if [[ $UDP_MODE != none ]]; then
-    systemctl enable --now "$QUIC_APP"
-    systemctl is-active --quiet "$QUIC_APP" || die "QUIC SNI 过滤服务启动失败。"
-  fi
   systemctl enable --now "$APP"
   systemctl is-active --quiet "$APP" || die "服务启动失败，请运行 systemctl status ${APP} 检查状态。"
 
@@ -885,10 +1054,8 @@ install_or_reconfigure() {
   printf '  节点后端端口：%s（公网已封锁）\n' "$NODE_PORT"
   printf '  用户连接端口：%s\n' "$PROXY_PORT"
   printf '  客户端 SNI：%s\n' "$FAKE_SNI"
-  if [[ $UDP_MODE == salamander ]]; then
-    printf '  UDP/HY2：Salamander 已启用\n'
-  elif [[ $UDP_MODE == plain ]]; then
-    printf '  UDP/HY2：无混淆\n'
+  if [[ $UDP_MODE == kernel ]]; then
+    printf '  UDP/HY2：xboard-node 内核 SNI 校验已启用\n'
   fi
   printf '\n客户端或面板订阅需要修改：\n'
   printf '  1. SNI 改为 %s\n' "$FAKE_SNI"
@@ -897,7 +1064,7 @@ install_or_reconfigure() {
   printf '  4. 节点地址和密码保持原样\n'
   printf '\n'
   warn "若客户端支持证书公钥固定，建议固定公钥，不要只依赖 insecure。"
-  warn "节点后端如有“拒绝未知 SNI”选项，请将其关闭。"
+  [[ $UDP_MODE == none ]] || warn "Salamander 密码继续由面板和 xboard-node 管理，本脚本不会读取或修改。"
   if [[ $UDP_MODE == none ]]; then
     warn "请确认云厂商安全组已经放行 TCP ${PROXY_PORT}，主机防火墙无法代替云安全组。"
   else
@@ -917,8 +1084,7 @@ show_status() {
   printf 'Nginx 公网端口：%s（用户连接端口）\n' "$PROXY_PORT"
   printf '大厂 SNI：%s\n' "$FAKE_SNI"
   case "${UDP_MODE:-none}" in
-    plain) printf 'UDP/HY2：已启用（无混淆）\n' ;;
-    salamander) printf 'UDP/HY2：已启用（Salamander）\n' ;;
+    kernel) printf 'UDP/HY2：xboard-node 内核 SNI 校验\n' ;;
     *) printf 'UDP/HY2：未启用\n' ;;
   esac
 
@@ -949,10 +1115,15 @@ show_status() {
     else
       printf 'QUIC 公网 UDP 监听：异常，端口未监听\n'
     fi
-    if systemctl is-active --quiet "$QUIC_APP" 2>/dev/null; then
-      printf 'QUIC SNI 过滤：运行中\n'
+    if systemctl is-active --quiet "$XBOARD_SERVICE" 2>/dev/null; then
+      printf 'xboard-node：运行中\n'
     else
-      printf 'QUIC SNI 过滤：未运行\n'
+      printf 'xboard-node：未运行\n'
+    fi
+    if [[ -f $XBOARD_DROPIN_FILE && -r $XBOARD_PATCH_STATE ]]; then
+      printf 'HY2 内核 SNI 补丁：已安装\n'
+    else
+      printf 'HY2 内核 SNI 补丁：未完整安装\n'
     fi
   fi
 
@@ -1004,7 +1175,7 @@ start_service() {
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装，请先选择“安装 / 重新配置”。"
   if [[ ${UDP_MODE:-none} != none ]]; then
-    systemctl start "$QUIC_APP"
+    systemctl start "$XBOARD_SERVICE"
   fi
   systemctl start "$APP"
   ok "服务已启动。"
@@ -1014,9 +1185,6 @@ stop_service() {
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装。"
   systemctl stop "$APP"
-  if [[ ${UDP_MODE:-none} != none ]]; then
-    systemctl stop "$QUIC_APP" || true
-  fi
   ok "服务已停止；原后端端口继续保持封锁，卸载后才恢复直连。"
 }
 
@@ -1024,7 +1192,8 @@ restart_service() {
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装，请先选择“安装 / 重新配置”。"
   if [[ ${UDP_MODE:-none} != none ]]; then
-    systemctl restart "$QUIC_APP"
+    systemctl restart "$XBOARD_SERVICE"
+    wait_for_xboard_udp || die "xboard-node 重启后未监听 UDP ${NODE_PORT}。"
   fi
   systemctl restart "$APP"
   ok "服务已重启。"
@@ -1035,8 +1204,8 @@ show_logs() {
   printf '\n========== 服务状态 ==========\n'
   systemctl --no-pager --full status "$APP" 2>/dev/null || true
   if [[ ${UDP_MODE:-none} != none ]]; then
-    printf '\n========== QUIC 过滤服务 ==========\n'
-    systemctl --no-pager --full status "$QUIC_APP" 2>/dev/null || true
+    printf '\n========== xboard-node 内核 SNI 服务 ==========\n'
+    systemctl --no-pager --full status "$XBOARD_SERVICE" 2>/dev/null || true
   fi
 
   printf '\n========== 最近 SNI 路由 ==========\n'
@@ -1047,12 +1216,14 @@ show_logs() {
   fi
 
   if [[ ${UDP_MODE:-none} != none ]]; then
-    printf '\n========== 最近 QUIC SNI 放行 ==========\n'
-    if [[ -f ${LOG_DIR}/quic.log ]]; then
-      tail -n 100 "${LOG_DIR}/quic.log"
+    printf '\n========== 最近 HY2 UDP 转发 ==========\n'
+    if [[ -f ${LOG_DIR}/udp-access.log ]]; then
+      tail -n 100 "${LOG_DIR}/udp-access.log"
     else
       printf '暂无 QUIC 访问日志。\n'
     fi
+    printf '\n========== 最近 xboard-node 日志 ==========\n'
+    journalctl -u "$XBOARD_SERVICE" -n 100 --no-pager -l 2>/dev/null || true
   fi
   printf '\n========== 最近错误 ==========\n'
   if [[ -f ${LOG_DIR}/error.log ]]; then
@@ -1080,6 +1251,7 @@ remove_app() {
     "$FW_HELPER" stop || true
   fi
   systemctl disable --now "$APP" >/dev/null 2>&1 || true
+  restore_xboard_node
   rm -f "$SERVICE_FILE" "$FW_HELPER"
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
   rm -f "$LOGROTATE_FILE"
@@ -1099,7 +1271,7 @@ show_menu() {
     printf '========================================\n'
     printf '       TLS 节点大厂 SNI 分流管理\n'
     printf '========================================\n'
-    printf '  1. 安装 / 重新配置\n'
+    printf '  1. 安装 / 重新配置1\n'
     printf '  2. 查看运行状态\n'
     printf '  3. 启动服务\n'
     printf '  4. 停止服务\n'
