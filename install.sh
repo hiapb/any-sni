@@ -458,7 +458,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${QUIC_FILTER_BIN} --listen 127.0.0.1:${QUIC_FILTER_PORT} --backend 127.0.0.1:${NODE_PORT} --sni ${FAKE_SNI} --log ${LOG_DIR}/quic.log ${mode_args}
+ExecStart=${QUIC_FILTER_BIN} --listen :${PROXY_PORT} --backend 127.0.0.1:${NODE_PORT} --sni ${FAKE_SNI} --log ${LOG_DIR}/quic.log ${mode_args}
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576
@@ -473,32 +473,12 @@ write_nginx_config() {
   local module_path=$1
   local load_module=""
   local ipv6_listen=""
-  local udp_config=""
 
   if [[ -n $module_path ]]; then
     load_module="load_module ${module_path};"
   fi
   if [[ -s /proc/net/if_inet6 ]]; then
     ipv6_listen="        listen [::]:${PROXY_PORT} ipv6only=on reuseport;"
-  fi
-  if [[ $UDP_MODE != none ]]; then
-    udp_config="
-    server {
-        listen 0.0.0.0:${PROXY_PORT} udp reuseport;
-        access_log ${LOG_DIR}/quic-access.log quic_route;
-        proxy_pass 127.0.0.1:${QUIC_FILTER_PORT};
-        proxy_timeout 2m;
-    }
-"
-    if [[ -s /proc/net/if_inet6 ]]; then
-      udp_config+="    server {
-        listen [::]:${PROXY_PORT} udp ipv6only=on reuseport;
-        access_log ${LOG_DIR}/quic-access.log quic_route;
-        proxy_pass 127.0.0.1:${QUIC_FILTER_PORT};
-        proxy_timeout 2m;
-    }
-"
-    fi
   fi
 
   mkdir -p "$BASE_DIR"
@@ -519,7 +499,6 @@ stream {
     }
 
     log_format sni_route '\$time_iso8601 client=\$remote_addr:\$remote_port sni="\$ssl_preread_server_name" route=\$selected_backend status=\$status sent=\$bytes_sent received=\$bytes_received time=\$session_time';
-    log_format quic_route '\$time_iso8601 client=\$remote_addr:\$remote_port protocol=UDP route=quic_filter status=\$status sent=\$bytes_sent received=\$bytes_received time=\$session_time';
 
     upstream tls_backend {
         server 127.0.0.1:${NODE_PORT};
@@ -540,7 +519,6 @@ ${ipv6_listen}
         proxy_timeout 1h;
         tcp_nodelay on;
     }
-${udp_config}
 }
 EOF
 }
@@ -881,13 +859,7 @@ install_or_reconfigure() {
   if port_is_in_use "$PROXY_PORT"; then
     die "Nginx 公网端口 $PROXY_PORT 仍被其他服务占用，请重新运行并选择其他端口。"
   fi
-  if [[ $UDP_MODE != none ]]; then
-    local filter_start=$((PROXY_PORT + 1))
-    (( filter_start <= 65535 )) || filter_start=39001
-    QUIC_FILTER_PORT=$(find_free_udp_port "$filter_start") || die "没有可用的本机 UDP 过滤端口。"
-  else
-    QUIC_FILTER_PORT=""
-  fi
+  QUIC_FILTER_PORT=""
 
   module_path=$(find_stream_module) || die "没有找到 Nginx Stream 模块。"
   save_salamander_key
@@ -973,9 +945,9 @@ show_status() {
       printf 'HY2 后端 UDP 监听：异常，端口未监听\n'
     fi
     if udp_port_is_listening "$PROXY_PORT"; then
-      printf 'Nginx 公网 UDP 监听：正常\n'
+      printf 'QUIC 公网 UDP 监听：正常\n'
     else
-      printf 'Nginx 公网 UDP 监听：异常，端口未监听\n'
+      printf 'QUIC 公网 UDP 监听：异常，端口未监听\n'
     fi
     if systemctl is-active --quiet "$QUIC_APP" 2>/dev/null; then
       printf 'QUIC SNI 过滤：运行中\n'
@@ -1127,7 +1099,7 @@ show_menu() {
     printf '========================================\n'
     printf '       TLS 节点大厂 SNI 分流管理\n'
     printf '========================================\n'
-    printf '  1. 安装 / 重新配置1\n'
+    printf '  1. 安装 / 重新配置\n'
     printf '  2. 查看运行状态\n'
     printf '  3. 启动服务\n'
     printf '  4. 停止服务\n'
