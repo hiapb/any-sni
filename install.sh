@@ -339,9 +339,19 @@ func salamanderDecode(packet, psk []byte) []byte {
   return out
 }
 
-func packetSNI(packet []byte, psk []byte, salamander bool) (string, bool) {
+func packetSNI(packet []byte, psk []byte, salamander bool) (serverName string, ok bool) {
+  defer func() {
+    if recover() != nil {
+      serverName, ok = "", false
+    }
+  }()
   if salamander { packet = salamanderDecode(packet, psk) }
   if len(packet) == 0 { return "", false }
+  hdr, offset, err := quicsni.ParseInitialHeader(packet)
+  if err != nil || hdr == nil || offset < 0 || hdr.Length < 0 ||
+    offset > int64(len(packet)) || hdr.Length > int64(len(packet))-offset {
+    return "", false
+  }
   hello, err := quicsni.ReadClientHello(packet)
   if err != nil || hello == nil { return "", false }
   return strings.TrimSpace(hello.ServerName), true
@@ -1117,7 +1127,7 @@ show_menu() {
     printf '========================================\n'
     printf '       TLS 节点大厂 SNI 分流管理\n'
     printf '========================================\n'
-    printf '  1. 安装 / 重新配置\n'
+    printf '  1. 安装 / 重新配置1\n'
     printf '  2. 查看运行状态\n'
     printf '  3. 启动服务\n'
     printf '  4. 停止服务\n'
