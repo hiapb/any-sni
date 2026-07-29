@@ -30,6 +30,15 @@ XBOARD_BACKUP_BIN="${BASE_DIR}/xboard-node.original"
 XBOARD_PATCH_STATE="${BASE_DIR}/xboard-patch.env"
 XBOARD_DROPIN_DIR="/etc/systemd/system/${XBOARD_SERVICE}.d"
 XBOARD_DROPIN_FILE="${XBOARD_DROPIN_DIR}/${APP}.conf"
+SINGBOX_SERVICE="sing-box.service"
+SINGBOX_CONFIG_FILE="/etc/sing-box/config.json"
+STANDALONE_SINGBOX_VERSION="1.13.15"
+STANDALONE_SINGBOX_ARCHIVE_SHA256="b43456c0cb2d4d7b81664010b2149a35ed6e3f6c245d78bcc7caf27c46eca816"
+STANDALONE_SINGBOX_SOURCE_DIR="/usr/local/src/${APP}-standalone-sing-box"
+STANDALONE_SINGBOX_BACKUP_BIN="${BASE_DIR}/sing-box.original"
+STANDALONE_SINGBOX_PATCH_STATE="${BASE_DIR}/sing-box-patch.env"
+STANDALONE_SINGBOX_DROPIN_DIR="/etc/systemd/system/${SINGBOX_SERVICE}.d"
+STANDALONE_SINGBOX_DROPIN_FILE="${STANDALONE_SINGBOX_DROPIN_DIR}/${APP}.conf"
 LEGACY_BASE_DIR="/etc/${LEGACY_APP}"
 LEGACY_STATE_FILE="${LEGACY_BASE_DIR}/state.env"
 LEGACY_FW_HELPER="/usr/local/sbin/${LEGACY_APP}-fw"
@@ -76,6 +85,55 @@ udp_port_is_listening() {
   ss -H -lnu "sport = :$1" 2>/dev/null | grep -q .
 }
 
+service_owns_udp_port() {
+  local service=$1 port=$2 pid
+  pid=$(systemctl show --property MainPID --value "$service" 2>/dev/null || true)
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  ss -H -lunp "sport = :${port}" 2>/dev/null | grep -Eq "pid=${pid},"
+}
+
+singbox_has_hysteria2_port() {
+  local port=$1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -r $SINGBOX_CONFIG_FILE ]] || return 1
+  jq -e --argjson port "$port" \
+    'any(.inbounds[]?; .type == "hysteria2" and .listen_port == $port)' \
+    "$SINGBOX_CONFIG_FILE" >/dev/null 2>&1
+}
+
+standalone_singbox_version_supported() {
+  local bin first_line version
+  bin=$(find_standalone_singbox_binary 2>/dev/null) || return 1
+  first_line=$("$bin" version 2>/dev/null) || return 1
+  first_line=${first_line%%$'\n'*}
+  version=${first_line#sing-box version }
+  [[ $version == "$STANDALONE_SINGBOX_VERSION" ||
+    $version == "tls-sni-${STANDALONE_SINGBOX_VERSION}" ]]
+}
+
+detect_udp_backend() {
+  local port=$1
+  if service_owns_udp_port "$XBOARD_SERVICE" "$port"; then
+    printf 'xboard\n'
+    return 0
+  fi
+  if service_owns_udp_port "$SINGBOX_SERVICE" "$port" &&
+    singbox_has_hysteria2_port "$port" &&
+    standalone_singbox_version_supported; then
+    printf 'singbox\n'
+    return 0
+  fi
+  return 1
+}
+
+udp_backend_service() {
+  case "${UDP_BACKEND:-none}" in
+    xboard) printf '%s\n' "$XBOARD_SERVICE" ;;
+    singbox) printf '%s\n' "$SINGBOX_SERVICE" ;;
+    *) return 1 ;;
+  esac
+}
+
 port_is_listening() {
   tcp_port_is_listening "$1"
 }
@@ -104,7 +162,9 @@ load_state() {
   PROXY_PORT=""
   FAKE_SNI=""
   UDP_MODE="none"
+  UDP_BACKEND="none"
   XBOARD_BIN_PATH=""
+  SINGBOX_BIN_PATH=""
   if [[ -r $STATE_FILE ]]; then
     # 状态文件只允许 root 写入，并且值在写入前已经校验。
     # shellcheck disable=SC1090
@@ -117,6 +177,17 @@ load_state() {
   case "${UDP_MODE:-none}" in
     plain|salamander) UDP_MODE="kernel" ;;
   esac
+  case "${UDP_BACKEND:-none}" in
+    xboard|singbox) ;;
+    *) UDP_BACKEND="none" ;;
+  esac
+  if [[ $UDP_MODE == kernel && $UDP_BACKEND == none ]]; then
+    if [[ -r $XBOARD_PATCH_STATE || -f $XBOARD_DROPIN_FILE ]]; then
+      UDP_BACKEND=xboard
+    elif [[ -r $STANDALONE_SINGBOX_PATCH_STATE || -f $STANDALONE_SINGBOX_DROPIN_FILE ]]; then
+      UDP_BACKEND=singbox
+    fi
+  fi
 }
 
 go_version_ok() {
@@ -281,7 +352,9 @@ NODE_PORT=$NODE_PORT
 PROXY_PORT=$PROXY_PORT
 FAKE_SNI=$FAKE_SNI
 UDP_MODE=$UDP_MODE
+UDP_BACKEND=${UDP_BACKEND:-none}
 XBOARD_BIN_PATH=${XBOARD_BIN_PATH:-}
+SINGBOX_BIN_PATH=${SINGBOX_BIN_PATH:-}
 EOF
   chmod 0600 "$STATE_FILE"
 }
@@ -530,7 +603,7 @@ EOF
 wait_for_xboard_udp() {
   local attempt
   for attempt in $(seq 1 30); do
-    if systemctl is-active --quiet "$XBOARD_SERVICE" && udp_port_is_listening "$NODE_PORT"; then
+    if systemctl is-active --quiet "$XBOARD_SERVICE" && service_owns_udp_port "$XBOARD_SERVICE" "$NODE_PORT"; then
       return 0
     fi
     systemctl is-failed --quiet "$XBOARD_SERVICE" && return 1
@@ -634,8 +707,349 @@ restore_xboard_node() {
   rm -rf "$XBOARD_SOURCE_DIR" "$SINGBOX_SOURCE_DIR"
 }
 
+find_standalone_singbox_binary() {
+  local candidate pid
+  if [[ -n ${SINGBOX_BIN_PATH:-} && -x $SINGBOX_BIN_PATH ]]; then
+    printf '%s\n' "$SINGBOX_BIN_PATH"
+    return 0
+  fi
+  pid=$(systemctl show --property MainPID --value "$SINGBOX_SERVICE" 2>/dev/null || true)
+  if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+    candidate=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)
+    if [[ -n $candidate && -x $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  for candidate in /usr/local/bin/sing-box /usr/bin/sing-box; do
+    if [[ -x $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  candidate=$(command -v sing-box 2>/dev/null || true)
+  if [[ -n $candidate && -x $candidate ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+write_standalone_singbox_patch() {
+  local patch_file=$1
+  cat >"$patch_file" <<'PATCH'
+--- a/option/tls.go
++++ b/option/tls.go
+@@ -12,6 +12,7 @@
+ type InboundTLSOptions struct {
+ 	Enabled                          bool                                `json:"enabled,omitempty"`
+ 	ServerName                       string                              `json:"server_name,omitempty"`
++	StrictServerName                 bool                                `json:"strict_server_name,omitempty"`
+ 	Insecure                         bool                                `json:"insecure,omitempty"`
+ 	ALPN                             badoption.Listable[string]          `json:"alpn,omitempty"`
+ 	MinVersion                       string                              `json:"min_version,omitempty"`
+--- a/common/tls/std_server.go
++++ b/common/tls/std_server.go
+@@ -371,6 +371,16 @@
+ 		echKeyPath:            echKeyPath,
+ 	}
+ 	serverConfig.config.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
++		if options.StrictServerName {
++			expectedServerName := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(options.ServerName)), ".")
++			clientServerName := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(info.ServerName)), ".")
++			if expectedServerName == "" {
++				return nil, E.New("tls: strict_server_name requires server_name")
++			}
++			if clientServerName != expectedServerName {
++				return nil, E.New("tls: rejected client SNI")
++			}
++		}
+ 		serverConfig.access.Lock()
+ 		defer serverConfig.access.Unlock()
+ 		return serverConfig.config, nil
+--- /dev/null
++++ b/common/tls/strict_server_name_test.go
+@@ -0,0 +1,36 @@
++package tls
++
++import (
++	"context"
++	stdTLS "crypto/tls"
++	"testing"
++
++	boxLog "github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++)
++
++func TestStrictServerName(t *testing.T) {
++	serverConfig, err := NewSTDServer(context.Background(), boxLog.NewNOPFactory().Logger(), option.InboundTLSOptions{
++		Enabled:          true,
++		ServerName:       "www.itunes.com",
++		StrictServerName: true,
++		Insecure:         true,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	stdConfig, err := serverConfig.STDConfig()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, serverName := range []string{"www.itunes.com", "WWW.ITUNES.COM."} {
++		if _, err = stdConfig.GetConfigForClient(&stdTLS.ClientHelloInfo{ServerName: serverName}); err != nil {
++			t.Fatalf("expected %q to pass: %v", serverName, err)
++		}
++	}
++	for _, serverName := range []string{"", "mtth.mm1998.com"} {
++		if _, err = stdConfig.GetConfigForClient(&stdTLS.ClientHelloInfo{ServerName: serverName}); err == nil {
++			t.Fatalf("expected %q to be rejected", serverName)
++		}
++	}
++}
+--- a/protocol/hysteria2/inbound.go
++++ b/protocol/hysteria2/inbound.go
+@@ -6,6 +6,9 @@
+ 	"net/http"
+ 	"net/http/httputil"
+ 	"net/url"
++	"os"
++	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -38,11 +41,26 @@
+ 	userNameList []string
+ }
+ 
++func applySNIGuard(options *option.Hysteria2InboundOptions) {
++	serverName := strings.TrimSpace(os.Getenv("SING_BOX_HYSTERIA2_SNI_GUARD"))
++	portText := strings.TrimSpace(os.Getenv("SING_BOX_HYSTERIA2_SNI_GUARD_PORT"))
++	if serverName == "" || portText == "" || options.TLS == nil || !options.TLS.Enabled {
++		return
++	}
++	port, err := strconv.ParseUint(portText, 10, 16)
++	if err != nil || uint16(port) != options.ListenPort {
++		return
++	}
++	options.TLS.ServerName = serverName
++	options.TLS.StrictServerName = true
++}
++
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
+ 	options.UDPFragmentDefault = true
+ 	if options.TLS == nil || !options.TLS.Enabled {
+ 		return nil, C.ErrTLSRequired
+ 	}
++	applySNIGuard(&options)
+ 	tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
+ 	if err != nil {
+ 		return nil, err
+--- /dev/null
++++ b/protocol/hysteria2/sni_guard_test.go
+@@ -0,0 +1,33 @@
++package hysteria2
++
++import (
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++)
++
++func TestApplySNIGuard(t *testing.T) {
++	t.Setenv("SING_BOX_HYSTERIA2_SNI_GUARD", "www.itunes.com")
++	t.Setenv("SING_BOX_HYSTERIA2_SNI_GUARD_PORT", "8446")
++	matching := option.Hysteria2InboundOptions{
++		ListenOptions: option.ListenOptions{ListenPort: 8446},
++		InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{TLS: &option.InboundTLSOptions{
++			Enabled: true,
++		}},
++	}
++	applySNIGuard(&matching)
++	if matching.TLS.ServerName != "www.itunes.com" || !matching.TLS.StrictServerName {
++		t.Fatal("matching Hysteria2 inbound did not receive the SNI guard")
++	}
++
++	nonMatching := option.Hysteria2InboundOptions{
++		ListenOptions: option.ListenOptions{ListenPort: 9443},
++		InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{TLS: &option.InboundTLSOptions{
++			Enabled: true,
++		}},
++	}
++	applySNIGuard(&nonMatching)
++	if nonMatching.TLS.StrictServerName {
++		t.Fatal("SNI guard leaked to a different Hysteria2 port")
++	}
++}
+PATCH
+  chmod 0600 "$patch_file"
+}
+
+build_patched_standalone_singbox() {
+  local current_bin=$1 tmp_dir archive output build_tags
+  local GOPROXY=${GOPROXY:-}
+  if [[ -z $GOPROXY ]]; then
+    GOPROXY='https://proxy.golang.org|https://goproxy.cn|direct'
+  fi
+  export GOPROXY
+  ensure_go
+  systemctl cat "$SINGBOX_SERVICE" >/dev/null 2>&1 ||
+    die "没有找到 ${SINGBOX_SERVICE}。"
+
+  tmp_dir=$(mktemp -d)
+  archive="${tmp_dir}/sing-box.tar.gz"
+  write_standalone_singbox_patch "${tmp_dir}/sing-box-sni-guard.patch"
+  download_source_archive \
+    "sing-box v${STANDALONE_SINGBOX_VERSION}" \
+    "https://github.com/SagerNet/sing-box/archive/refs/tags/v${STANDALONE_SINGBOX_VERSION}.tar.gz" \
+    "$STANDALONE_SINGBOX_ARCHIVE_SHA256" \
+    "$STANDALONE_SINGBOX_SOURCE_DIR" \
+    "$archive"
+  patch --batch --forward -d "$STANDALONE_SINGBOX_SOURCE_DIR" -p1 \
+    <"${tmp_dir}/sing-box-sni-guard.patch"
+
+  build_tags=$("$GO_BIN" version -m "$current_bin" 2>/dev/null |
+    sed -n 's/^[[:space:]]*build[[:space:]]*-tags=//p' | head -n 1)
+  if [[ -z $build_tags ]]; then
+    build_tags=$(<"${STANDALONE_SINGBOX_SOURCE_DIR}/release/DEFAULT_BUILD_TAGS_OTHERS")
+  fi
+
+  mkdir -p "$CACHE_DIR/mod" "$CACHE_DIR/build"
+  (
+    cd "$STANDALONE_SINGBOX_SOURCE_DIR"
+    CGO_ENABLED=0 GOTOOLCHAIN=local \
+      GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" \
+      "$GO_BIN" test ./common/tls ./protocol/hysteria2
+    CGO_ENABLED=0 GOTOOLCHAIN=local \
+      GOMODCACHE="$CACHE_DIR/mod" GOCACHE="$CACHE_DIR/build" \
+      "$GO_BIN" build \
+        -trimpath \
+        -tags "$build_tags" \
+        -ldflags "-X github.com/sagernet/sing-box/constant.Version=tls-sni-${STANDALONE_SINGBOX_VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -s -w -buildid=" \
+        -o sing-box.tls-sni ./cmd/sing-box
+  )
+  output="${STANDALONE_SINGBOX_SOURCE_DIR}/sing-box.tls-sni"
+  [[ -x $output ]] || die "补丁版 sing-box 构建失败。"
+  "$GO_BIN" version -m "$output" >/dev/null 2>&1 || die "补丁版 sing-box 校验失败。"
+  rm -rf "$tmp_dir"
+}
+
+write_standalone_singbox_dropin() {
+  mkdir -p "$STANDALONE_SINGBOX_DROPIN_DIR"
+  cat >"$STANDALONE_SINGBOX_DROPIN_FILE" <<EOF
+[Service]
+Environment=SING_BOX_HYSTERIA2_SNI_GUARD=${FAKE_SNI}
+Environment=SING_BOX_HYSTERIA2_SNI_GUARD_PORT=${NODE_PORT}
+EOF
+  chmod 0644 "$STANDALONE_SINGBOX_DROPIN_FILE"
+}
+
+wait_for_udp_service() {
+  local service=$1 attempt
+  for attempt in $(seq 1 30); do
+    if systemctl is-active --quiet "$service" && service_owns_udp_port "$service" "$NODE_PORT"; then
+      return 0
+    fi
+    systemctl is-failed --quiet "$service" && return 1
+    sleep 1
+  done
+  return 1
+}
+
+install_patched_standalone_singbox() {
+  local built_bin current_bin current_sha previous_patched_sha=""
+  local rollback_bin rollback_dropin patched_sha had_dropin=0
+  current_bin=$(find_standalone_singbox_binary) || die "没有找到 sing-box 可执行文件。"
+  [[ $current_bin != *[[:space:]]* ]] || die "sing-box 路径包含空白字符，无法安全处理。"
+  SINGBOX_BIN_PATH=$current_bin
+
+  build_patched_standalone_singbox "$current_bin"
+  built_bin="${STANDALONE_SINGBOX_SOURCE_DIR}/sing-box.tls-sni"
+  mkdir -p "$BASE_DIR"
+  current_sha=$(sha256_file "$current_bin")
+  if [[ -r $STANDALONE_SINGBOX_PATCH_STATE ]]; then
+    previous_patched_sha=$(awk -F= '$1 == "PATCHED_SHA256" { print $2; exit }' "$STANDALONE_SINGBOX_PATCH_STATE")
+  fi
+  if [[ ! -s $STANDALONE_SINGBOX_BACKUP_BIN ]]; then
+    install -m 0755 "$current_bin" "$STANDALONE_SINGBOX_BACKUP_BIN"
+  elif [[ -n $previous_patched_sha && $current_sha != "$previous_patched_sha" ]]; then
+    install -m 0755 "$current_bin" "$STANDALONE_SINGBOX_BACKUP_BIN"
+  fi
+
+  rollback_bin=$(mktemp)
+  install -m 0755 "$current_bin" "$rollback_bin"
+  rollback_dropin="${rollback_bin}.dropin"
+  if [[ -f $STANDALONE_SINGBOX_DROPIN_FILE ]]; then
+    cp -a "$STANDALONE_SINGBOX_DROPIN_FILE" "$rollback_dropin"
+    had_dropin=1
+  fi
+
+  write_standalone_singbox_dropin
+  systemctl stop "$SINGBOX_SERVICE"
+  install -m 0755 "$built_bin" "$current_bin"
+  systemctl daemon-reload
+  if ! systemctl start "$SINGBOX_SERVICE" || ! wait_for_udp_service "$SINGBOX_SERVICE"; then
+    warn "补丁版 sing-box 启动失败，正在自动回滚。"
+    systemctl stop "$SINGBOX_SERVICE" >/dev/null 2>&1 || true
+    install -m 0755 "$rollback_bin" "$current_bin"
+    if (( had_dropin == 1 )); then
+      install -m 0644 "$rollback_dropin" "$STANDALONE_SINGBOX_DROPIN_FILE"
+    else
+      rm -f "$STANDALONE_SINGBOX_DROPIN_FILE"
+    fi
+    systemctl daemon-reload
+    systemctl start "$SINGBOX_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$rollback_bin" "$rollback_dropin"
+    die "补丁版 sing-box 未能监听 UDP ${NODE_PORT}，原二进制已经恢复。"
+  fi
+
+  rm -f "$rollback_bin" "$rollback_dropin"
+  patched_sha=$(sha256_file "$current_bin")
+  umask 077
+  cat >"$STANDALONE_SINGBOX_PATCH_STATE" <<EOF
+SINGBOX_BIN_PATH=$current_bin
+PATCHED_SHA256=$patched_sha
+SINGBOX_VERSION=$STANDALONE_SINGBOX_VERSION
+EOF
+  chmod 0600 "$STANDALONE_SINGBOX_PATCH_STATE"
+  ok "sing-box 已替换为 HY2 内核 SNI 校验版本。"
+}
+
+restore_standalone_singbox() {
+  local current_sha="" marker_sha="" restore_bin=""
+  if [[ -r $STANDALONE_SINGBOX_PATCH_STATE ]]; then
+    # shellcheck disable=SC1090
+    source "$STANDALONE_SINGBOX_PATCH_STATE"
+    marker_sha=${PATCHED_SHA256:-}
+    restore_bin=${SINGBOX_BIN_PATH:-}
+  fi
+  if [[ -z $restore_bin ]]; then
+    restore_bin=$(find_standalone_singbox_binary 2>/dev/null || true)
+  fi
+
+  rm -f "$STANDALONE_SINGBOX_DROPIN_FILE"
+  rmdir "$STANDALONE_SINGBOX_DROPIN_DIR" >/dev/null 2>&1 || true
+  systemctl daemon-reload
+
+  if [[ -n $restore_bin && -x $restore_bin && -s $STANDALONE_SINGBOX_BACKUP_BIN ]]; then
+    current_sha=$(sha256_file "$restore_bin")
+    if [[ -z $marker_sha || $current_sha == "$marker_sha" ]]; then
+      systemctl stop "$SINGBOX_SERVICE" >/dev/null 2>&1 || true
+      install -m 0755 "$STANDALONE_SINGBOX_BACKUP_BIN" "$restore_bin"
+      systemctl start "$SINGBOX_SERVICE" >/dev/null 2>&1 || true
+      info "已恢复原版 sing-box。"
+    else
+      warn "sing-box 在安装补丁后又被修改，未覆盖当前二进制；仅移除了 SNI 环境配置。"
+      systemctl restart "$SINGBOX_SERVICE" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$STANDALONE_SINGBOX_PATCH_STATE" "$STANDALONE_SINGBOX_BACKUP_BIN"
+  rm -rf "$STANDALONE_SINGBOX_SOURCE_DIR"
+}
+
 write_nginx_config() {
   local module_path=$1
+  local output_file=${2:-$NGINX_CONF}
   local load_module=""
   local ipv6_listen=""
   local ipv6_udp_listen=""
@@ -662,8 +1076,8 @@ EOF
 )
   fi
 
-  mkdir -p "$BASE_DIR"
-  cat >"$NGINX_CONF" <<EOF
+  mkdir -p "$(dirname "$output_file")"
+  cat >"$output_file" <<EOF
 ${load_module}
 worker_processes auto;
 worker_rlimit_nofile 1048576;
@@ -824,12 +1238,13 @@ EOF
 }
 
 write_service() {
-  local nginx_bin
+  local nginx_bin udp_service=""
   nginx_bin=$(command -v nginx)
   local node_dependency=""
   if [[ $UDP_MODE != none ]]; then
-    node_dependency="After=${XBOARD_SERVICE}"
-    node_dependency+=$'\nWants='"${XBOARD_SERVICE}"
+    udp_service=$(udp_backend_service) || die "UDP 后端服务状态无效。"
+    node_dependency="After=${udp_service}"
+    node_dependency+=$'\nWants='"${udp_service}"
   fi
 
   cat >"$SERVICE_FILE" <<EOF
@@ -903,39 +1318,40 @@ read_sni_value() {
   done
 }
 
-read_udp_mode() {
-  local old_mode=${1:-none}
-  local choice
-  while true; do
-    printf '\n请选择 UDP/HY2 模式：\n'
-    printf '  1) 不启用 UDP\n'
-    printf '  2) HY2 内核 SNI 校验（兼容无混淆和 Salamander）\n'
-    if [[ $old_mode == none ]]; then
-      printf '  直接回车：1\n'
-    else
-      printf '  直接回车：保持当前模式\n'
-    fi
-    read -r -p "请选择 [1-2]: " choice
-    if [[ -z $choice && $old_mode != none ]]; then
-      UDP_MODE=$old_mode
-      return
-    fi
-    case "${choice:-1}" in
-      1) UDP_MODE=none; return ;;
-      2) UDP_MODE=kernel; return ;;
-      *) warn "请输入 1 或 2。" ;;
-    esac
-  done
+detect_install_udp_mode() {
+  UDP_BACKEND=$(detect_udp_backend "$NODE_PORT" 2>/dev/null || true)
+  case "$UDP_BACKEND" in
+    xboard)
+      UDP_MODE=kernel
+      info "检测到 xboard-node Hysteria2 UDP 后端：${NODE_PORT}。"
+      ;;
+    singbox)
+      UDP_MODE=kernel
+      info "检测到官方 sing-box Hysteria2 UDP 后端：${NODE_PORT}。"
+      ;;
+    *)
+      UDP_MODE=none
+      UDP_BACKEND=none
+      if service_owns_udp_port "$SINGBOX_SERVICE" "$NODE_PORT" &&
+        singbox_has_hysteria2_port "$NODE_PORT" &&
+        ! standalone_singbox_version_supported; then
+        warn "检测到 sing-box HY2，但其版本不是受支持的 ${STANDALONE_SINGBOX_VERSION}，不会替换二进制，已自动回退为仅 TCP。"
+      elif udp_port_is_listening "$NODE_PORT"; then
+        warn "UDP ${NODE_PORT} 不是受支持的 xboard-node/sing-box HY2，已自动回退为仅 TCP。"
+      else
+        info "未检测到受支持的 HY2 UDP 后端，将按纯 TCP 模式配置。"
+      fi
+      ;;
+  esac
 }
 
 read_install_values() {
-  local old_node_port old_proxy_port old_sni old_udp_mode input suggested_proxy_port
+  local old_node_port old_proxy_port old_sni input suggested_proxy_port
 
   load_state
   old_node_port=$NODE_PORT
   old_proxy_port=$PROXY_PORT
   old_sni=$FAKE_SNI
-  old_udp_mode=${UDP_MODE:-none}
 
   printf '\n请填写后端端口、选择大厂 SNI 并设置 Nginx 公网端口。\n\n'
 
@@ -949,6 +1365,8 @@ read_install_values() {
     valid_port "$NODE_PORT" && break
     warn "端口必须是 1 到 65535 之间的数字。"
   done
+
+  detect_install_udp_mode
 
   read_sni_value "$old_sni"
 
@@ -978,11 +1396,10 @@ read_install_values() {
     fi
     break
   done
-  read_udp_mode "$old_udp_mode"
 }
 
 install_or_reconfigure() {
-  local module_path
+  local module_path preflight_conf
 
   load_state
   read_install_values
@@ -991,9 +1408,10 @@ install_or_reconfigure() {
   printf '  节点后端端口：%s（仅供本机 Nginx 回连）\n' "$NODE_PORT"
   printf '  Nginx 公网端口：%s（用户连接此端口）\n' "$PROXY_PORT"
   printf '  大厂 SNI：%s\n' "$FAKE_SNI"
-  case "$UDP_MODE" in
-    kernel) printf '  UDP/HY2：内核 SNI 校验（兼容 Salamander）\n' ;;
-    *) printf '  UDP/HY2：未启用\n' ;;
+  case "${UDP_BACKEND:-none}" in
+    xboard) printf '  UDP/HY2：xboard-node 内核 SNI 校验（兼容 Salamander）\n' ;;
+    singbox) printf '  UDP/HY2：官方 sing-box 内核 SNI 校验（兼容 Salamander）\n' ;;
+    *) printf '  UDP/HY2：未识别，自动使用纯 TCP\n' ;;
   esac
   printf '  节点后端配置及密码：保持不变\n'
   printf '  HTTP 申请证书及 80 端口：不修改\n\n'
@@ -1015,6 +1433,17 @@ install_or_reconfigure() {
     die "UDP 端口 $NODE_PORT 没有服务监听。请先确认 HY2 节点已正常运行。"
   fi
 
+  module_path=$(find_stream_module) || die "没有找到 Nginx Stream 模块。"
+  mkdir -p "$BASE_DIR"
+  mkdir -p "$LOG_DIR"
+  chmod 0755 "$LOG_DIR"
+  preflight_conf=$(mktemp)
+  write_nginx_config "$module_path" "$preflight_conf"
+  if ! nginx -t -c "$preflight_conf" -p "$BASE_DIR/"; then
+    rm -f "$preflight_conf"
+    die "Nginx 配置校验失败，现有分流和节点后端均未修改。"
+  fi
+
   # 先撤销旧转发，保证重新配置时不会残留规则或占用内部端口。
   cleanup_legacy_install
   if systemctl is-active --quiet "$APP" 2>/dev/null; then
@@ -1028,23 +1457,37 @@ install_or_reconfigure() {
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
 
   if port_is_in_use "$PROXY_PORT"; then
+    rm -f "$preflight_conf"
     die "Nginx 公网端口 $PROXY_PORT 仍被其他服务占用，请重新运行并选择其他端口。"
   fi
-  module_path=$(find_stream_module) || die "没有找到 Nginx Stream 模块。"
-  if [[ $UDP_MODE != none ]]; then
-    install_patched_xboard
-  elif [[ -f $XBOARD_PATCH_STATE || -f $XBOARD_DROPIN_FILE ]]; then
-    restore_xboard_node
-    XBOARD_BIN_PATH=""
-  fi
 
-  write_state
+  mkdir -p "$BASE_DIR"
+  install -m 0644 "$preflight_conf" "$NGINX_CONF"
+  rm -f "$preflight_conf"
   write_logrotate_config
-  write_nginx_config "$module_path"
   write_firewall_helper
   write_service
 
-  nginx -t -c "$NGINX_CONF" -p "$BASE_DIR/"
+  case "${UDP_BACKEND:-none}" in
+    xboard)
+      restore_standalone_singbox
+      SINGBOX_BIN_PATH=""
+      install_patched_xboard
+      ;;
+    singbox)
+      restore_xboard_node
+      XBOARD_BIN_PATH=""
+      install_patched_standalone_singbox
+      ;;
+    *)
+      restore_xboard_node
+      restore_standalone_singbox
+      XBOARD_BIN_PATH=""
+      SINGBOX_BIN_PATH=""
+      ;;
+  esac
+
+  write_state
   systemctl daemon-reload
   systemctl enable --now "$APP"
   systemctl is-active --quiet "$APP" || die "服务启动失败，请运行 systemctl status ${APP} 检查状态。"
@@ -1054,9 +1497,10 @@ install_or_reconfigure() {
   printf '  节点后端端口：%s（公网已封锁）\n' "$NODE_PORT"
   printf '  用户连接端口：%s\n' "$PROXY_PORT"
   printf '  客户端 SNI：%s\n' "$FAKE_SNI"
-  if [[ $UDP_MODE == kernel ]]; then
-    printf '  UDP/HY2：xboard-node 内核 SNI 校验已启用\n'
-  fi
+  case "${UDP_BACKEND:-none}" in
+    xboard) printf '  UDP/HY2：xboard-node 内核 SNI 校验已启用\n' ;;
+    singbox) printf '  UDP/HY2：官方 sing-box 内核 SNI 校验已启用\n' ;;
+  esac
   printf '\n客户端或面板订阅需要修改：\n'
   printf '  1. SNI 改为 %s\n' "$FAKE_SNI"
   printf '  2. 端口改为 %s\n' "$PROXY_PORT"
@@ -1064,7 +1508,7 @@ install_or_reconfigure() {
   printf '  4. 节点地址和密码保持原样\n'
   printf '\n'
   warn "若客户端支持证书公钥固定，建议固定公钥，不要只依赖 insecure。"
-  [[ $UDP_MODE == none ]] || warn "Salamander 密码继续由面板和 xboard-node 管理，本脚本不会读取或修改。"
+  [[ $UDP_MODE == none ]] || warn "Salamander 配置继续由 HY2 后端管理，本脚本不会读取或修改。"
   if [[ $UDP_MODE == none ]]; then
     warn "请确认云厂商安全组已经放行 TCP ${PROXY_PORT}，主机防火墙无法代替云安全组。"
   else
@@ -1073,6 +1517,7 @@ install_or_reconfigure() {
 }
 
 show_status() {
+  local udp_service="" udp_label=""
   load_state
   printf '\n========== 当前状态 ==========\n'
   if [[ -z $NODE_PORT ]]; then
@@ -1083,9 +1528,10 @@ show_status() {
   printf 'TLS 后端端口：%s（禁止公网直连）\n' "$NODE_PORT"
   printf 'Nginx 公网端口：%s（用户连接端口）\n' "$PROXY_PORT"
   printf '大厂 SNI：%s\n' "$FAKE_SNI"
-  case "${UDP_MODE:-none}" in
-    kernel) printf 'UDP/HY2：xboard-node 内核 SNI 校验\n' ;;
-    *) printf 'UDP/HY2：未启用\n' ;;
+  case "${UDP_BACKEND:-none}" in
+    xboard) printf 'UDP/HY2：xboard-node 内核 SNI 校验\n' ;;
+    singbox) printf 'UDP/HY2：官方 sing-box 内核 SNI 校验\n' ;;
+    *) printf 'UDP/HY2：未启用（纯 TCP）\n' ;;
   esac
 
   if systemctl is-active --quiet "$APP" 2>/dev/null; then
@@ -1115,16 +1561,33 @@ show_status() {
     else
       printf 'QUIC 公网 UDP 监听：异常，端口未监听\n'
     fi
-    if systemctl is-active --quiet "$XBOARD_SERVICE" 2>/dev/null; then
-      printf 'xboard-node：运行中\n'
+    udp_service=$(udp_backend_service 2>/dev/null || true)
+    case "${UDP_BACKEND:-none}" in
+      xboard) udp_label="xboard-node" ;;
+      singbox) udp_label="sing-box" ;;
+      *) udp_label="HY2 后端" ;;
+    esac
+    if [[ -n $udp_service ]] && systemctl is-active --quiet "$udp_service" 2>/dev/null; then
+      printf '%s：运行中\n' "$udp_label"
     else
-      printf 'xboard-node：未运行\n'
+      printf '%s：未运行\n' "$udp_label"
     fi
-    if [[ -f $XBOARD_DROPIN_FILE && -r $XBOARD_PATCH_STATE ]]; then
-      printf 'HY2 内核 SNI 补丁：已安装\n'
-    else
-      printf 'HY2 内核 SNI 补丁：未完整安装\n'
-    fi
+    case "${UDP_BACKEND:-none}" in
+      xboard)
+        if [[ -f $XBOARD_DROPIN_FILE && -r $XBOARD_PATCH_STATE ]]; then
+          printf 'HY2 内核 SNI 补丁：已安装\n'
+        else
+          printf 'HY2 内核 SNI 补丁：未完整安装\n'
+        fi
+        ;;
+      singbox)
+        if [[ -f $STANDALONE_SINGBOX_DROPIN_FILE && -r $STANDALONE_SINGBOX_PATCH_STATE ]]; then
+          printf 'HY2 内核 SNI 补丁：已安装\n'
+        else
+          printf 'HY2 内核 SNI 补丁：未完整安装\n'
+        fi
+        ;;
+    esac
   fi
 
   if port_is_listening "$PROXY_PORT"; then
@@ -1172,10 +1635,12 @@ show_status() {
 }
 
 start_service() {
+  local udp_service=""
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装，请先选择“安装 / 重新配置”。"
   if [[ ${UDP_MODE:-none} != none ]]; then
-    systemctl start "$XBOARD_SERVICE"
+    udp_service=$(udp_backend_service) || die "没有记录有效的 HY2 后端服务。"
+    systemctl start "$udp_service"
   fi
   systemctl start "$APP"
   ok "服务已启动。"
@@ -1189,23 +1654,32 @@ stop_service() {
 }
 
 restart_service() {
+  local udp_service=""
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装，请先选择“安装 / 重新配置”。"
   if [[ ${UDP_MODE:-none} != none ]]; then
-    systemctl restart "$XBOARD_SERVICE"
-    wait_for_xboard_udp || die "xboard-node 重启后未监听 UDP ${NODE_PORT}。"
+    udp_service=$(udp_backend_service) || die "没有记录有效的 HY2 后端服务。"
+    systemctl restart "$udp_service"
+    wait_for_udp_service "$udp_service" || die "HY2 后端重启后未监听 UDP ${NODE_PORT}。"
   fi
   systemctl restart "$APP"
   ok "服务已重启。"
 }
 
 show_logs() {
+  local udp_service="" udp_label=""
   load_state
   printf '\n========== 服务状态 ==========\n'
   systemctl --no-pager --full status "$APP" 2>/dev/null || true
   if [[ ${UDP_MODE:-none} != none ]]; then
-    printf '\n========== xboard-node 内核 SNI 服务 ==========\n'
-    systemctl --no-pager --full status "$XBOARD_SERVICE" 2>/dev/null || true
+    udp_service=$(udp_backend_service 2>/dev/null || true)
+    case "${UDP_BACKEND:-none}" in
+      xboard) udp_label="xboard-node" ;;
+      singbox) udp_label="sing-box" ;;
+      *) udp_label="HY2 后端" ;;
+    esac
+    printf '\n========== %s 内核 SNI 服务 ==========\n' "$udp_label"
+    [[ -z $udp_service ]] || systemctl --no-pager --full status "$udp_service" 2>/dev/null || true
   fi
 
   printf '\n========== 最近 SNI 路由 ==========\n'
@@ -1222,8 +1696,8 @@ show_logs() {
     else
       printf '暂无 QUIC 访问日志。\n'
     fi
-    printf '\n========== 最近 xboard-node 日志 ==========\n'
-    journalctl -u "$XBOARD_SERVICE" -n 100 --no-pager -l 2>/dev/null || true
+    printf '\n========== 最近 %s 日志 ==========\n' "$udp_label"
+    [[ -z $udp_service ]] || journalctl -u "$udp_service" -n 100 --no-pager -l 2>/dev/null || true
   fi
   printf '\n========== 最近错误 ==========\n'
   if [[ -f ${LOG_DIR}/error.log ]]; then
@@ -1252,6 +1726,7 @@ remove_app() {
   fi
   systemctl disable --now "$APP" >/dev/null 2>&1 || true
   restore_xboard_node
+  restore_standalone_singbox
   rm -f "$SERVICE_FILE" "$FW_HELPER"
   rm -f "/var/log/${APP}.log" "/run/${APP}.pid"
   rm -f "$LOGROTATE_FILE"
