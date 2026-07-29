@@ -278,11 +278,9 @@ EOF
 write_salamander_key() {
   local first second
   while true; do
-    read -r -s -p "请输入节点的 Salamander 密码（输入不显示）: " first
-    printf '\n'
+    read -r -p "请输入节点的 Salamander 密码: " first
     [[ ${#first} -ge 4 ]] || { warn "Salamander 密码至少 4 个字符。"; continue; }
-    read -r -s -p "请再次输入 Salamander 密码: " second
-    printf '\n'
+    read -r -p "请再次输入 Salamander 密码: " second
     [[ $first == "$second" ]] || { warn "两次密码不一致，请重试。"; continue; }
     SALAMANDER_NEW_PASSWORD=$first
     return
@@ -810,12 +808,10 @@ read_install_values() {
   read_udp_mode "$old_udp_mode"
   if [[ $UDP_MODE == salamander ]]; then
     if [[ -s $SALAMANDER_KEY_FILE ]]; then
-      read -r -s -p "请输入节点的 Salamander 密码（直接回车保留）: " input
-      printf '\n'
+      read -r -p "请输入节点的 Salamander 密码（直接回车保留）: " input
       if [[ -n $input ]]; then
         local first=$input second
-        read -r -s -p "请再次输入 Salamander 密码: " second
-        printf '\n'
+        read -r -p "请再次输入 Salamander 密码: " second
         [[ $first == "$second" ]] || die "两次 Salamander 密码不一致。"
         [[ ${#first} -ge 4 ]] || die "Salamander 密码至少 4 个字符。"
         SALAMANDER_NEW_PASSWORD=$first
