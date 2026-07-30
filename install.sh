@@ -30,6 +30,7 @@ XBOARD_BACKUP_BIN="${BASE_DIR}/xboard-node.original"
 XBOARD_PATCH_STATE="${BASE_DIR}/xboard-patch.env"
 XBOARD_DROPIN_DIR="/etc/systemd/system/${XBOARD_SERVICE}.d"
 XBOARD_DROPIN_FILE="${XBOARD_DROPIN_DIR}/${APP}.conf"
+XBOARD_HY2_MARKER_PREFIX="/run/${APP}-xboard-hy2"
 SINGBOX_SERVICE="sing-box.service"
 SINGBOX_CONFIG_FILE="/etc/sing-box/config.json"
 STANDALONE_SINGBOX_VERSION="1.13.15"
@@ -92,6 +93,21 @@ service_owns_udp_port() {
   ss -H -lunp "sport = :${port}" 2>/dev/null | grep -Eq "pid=${pid},"
 }
 
+xboard_hy2_marker_file() {
+  printf '%s-%s.ready\n' "$XBOARD_HY2_MARKER_PREFIX" "$1"
+}
+
+xboard_hysteria2_is_confirmed() {
+  local port=$1 expected_sni=${2:-} marker marker_port marker_sni
+  marker=$(xboard_hy2_marker_file "$port")
+  service_owns_udp_port "$XBOARD_SERVICE" "$port" || return 1
+  [[ -r $marker ]] || return 1
+  read -r marker_port marker_sni <"$marker" || return 1
+  [[ $marker_port == "$port" ]] || return 1
+  valid_hostname "$marker_sni" || return 1
+  [[ -z $expected_sni || $marker_sni == "$expected_sni" ]]
+}
+
 singbox_has_hysteria2_port() {
   local port=$1
   command -v jq >/dev/null 2>&1 || return 1
@@ -111,15 +127,29 @@ standalone_singbox_version_supported() {
     $version == "tls-sni-${STANDALONE_SINGBOX_VERSION}" ]]
 }
 
+standalone_singbox_hysteria2_is_confirmed() {
+  local port=$1
+  service_owns_udp_port "$SINGBOX_SERVICE" "$port" &&
+    singbox_has_hysteria2_port "$port" &&
+    standalone_singbox_version_supported
+}
+
+standalone_singbox_sni_guard_is_configured() {
+  local port=$1 expected_sni=$2
+  [[ -r $STANDALONE_SINGBOX_DROPIN_FILE ]] || return 1
+  grep -Fxq "Environment=SING_BOX_HYSTERIA2_SNI_GUARD=${expected_sni}" \
+    "$STANDALONE_SINGBOX_DROPIN_FILE" &&
+    grep -Fxq "Environment=SING_BOX_HYSTERIA2_SNI_GUARD_PORT=${port}" \
+      "$STANDALONE_SINGBOX_DROPIN_FILE"
+}
+
 detect_udp_backend() {
   local port=$1
   if service_owns_udp_port "$XBOARD_SERVICE" "$port"; then
     printf 'xboard\n'
     return 0
   fi
-  if service_owns_udp_port "$SINGBOX_SERVICE" "$port" &&
-    singbox_has_hysteria2_port "$port" &&
-    standalone_singbox_version_supported; then
+  if standalone_singbox_hysteria2_is_confirmed "$port"; then
     printf 'singbox\n'
     return 0
   fi
@@ -490,28 +520,88 @@ PATCH
  	"path/filepath"
  	"strconv"
  	"strings"
-@@ -678,6 +679,13 @@
+@@ -430,6 +431,7 @@
+ }
+ 
+ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
++	clearHysteria2SNIGuardMarker(nc)
+ 	base := M{
+ 		"tag":         nc.Protocol + "-in",
+ 		"listen":      "::",
+@@ -678,6 +680,16 @@
  	if tls == nil {
  		nlog.Core().Warn("hysteria requires TLS certificate files on disk; configure cert_mode (self, file, http, dns, or content). Sing-box will not start this inbound without tls.")
  		return base
 +	}
-+	if nc.Version == 2 {
-+		guardedServerName := strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD"))
-+		if guardedServerName != "" {
-+			tls["server_name"] = guardedServerName
-+			tls["strict_server_name"] = true
++	if guardedServerName, markerPath, guarded := hysteria2SNIGuard(nc); guarded {
++		tls["server_name"] = guardedServerName
++		tls["strict_server_name"] = true
++		if markerPath != "" {
++			content := fmt.Sprintf("%d %s\n", nc.ServerPort, guardedServerName)
++			if err := os.WriteFile(markerPath, []byte(content), 0o600); err != nil {
++				nlog.Core().Warn("cannot write hysteria2 SNI guard marker", "error", err)
++			}
 +		}
  	}
  	// Hysteria/Hysteria2 uses QUIC and requires ALPN; default to h3 if not set.
  	if _, ok := tls["alpn"]; !ok {
+@@ -685,8 +697,36 @@
+ 	}
+ 	base["tls"] = tls
+ 	return base
++}
++
++func hysteria2SNIGuard(nc *model.NodeSpec) (string, string, bool) {
++	if nc == nil || nc.Protocol != "hysteria" || nc.Version != 2 {
++		return "", "", false
++	}
++	serverName := strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD"))
++	portText := strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD_PORT"))
++	port, err := strconv.Atoi(portText)
++	if serverName == "" || err != nil || port != nc.ServerPort {
++		return "", "", false
++	}
++	markerPath := strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD_MARKER"))
++	return serverName, markerPath, true
+ }
+ 
++func clearHysteria2SNIGuardMarker(nc *model.NodeSpec) {
++	if nc == nil {
++		return
++	}
++	port, err := strconv.Atoi(strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD_PORT")))
++	if err != nil || port != nc.ServerPort {
++		return
++	}
++	markerPath := strings.TrimSpace(os.Getenv("XBOARD_HYSTERIA2_SNI_GUARD_MARKER"))
++	if markerPath != "" {
++		_ = os.Remove(markerPath)
++	}
++}
++
+ func buildTUIC(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+ 	base["type"] = "tuic"
+ 
 --- a/internal/kernel/singbox/config_test.go
 +++ b/internal/kernel/singbox/config_test.go
-@@ -338,6 +338,19 @@
+@@ -2,6 +2,8 @@
+ 
+ import (
+ 	"encoding/json"
++	"os"
++	"path/filepath"
+ 	"reflect"
+ 	"testing"
+ 
+@@ -336,6 +338,44 @@
  	assertMapValue(t, tls, "enabled", true)
  }
  
 +func TestBuildInbound_Hysteria2_WithSNIGuard(t *testing.T) {
++	markerPath := filepath.Join(t.TempDir(), "hysteria2.ready")
 +	t.Setenv("XBOARD_HYSTERIA2_SNI_GUARD", "www.itunes.com")
++	t.Setenv("XBOARD_HYSTERIA2_SNI_GUARD_PORT", "444")
++	t.Setenv("XBOARD_HYSTERIA2_SNI_GUARD_MARKER", markerPath)
 +	nc := &panel.NodeConfig{
 +		Protocol:   "hysteria",
 +		ServerPort: 444,
@@ -521,6 +611,28 @@ PATCH
 +	tls := inbound["tls"].(M)
 +	assertMapValue(t, tls, "server_name", "www.itunes.com")
 +	assertMapValue(t, tls, "strict_server_name", true)
++	marker, err := os.ReadFile(markerPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(marker) != "444 www.itunes.com\n" {
++		t.Fatalf("unexpected SNI guard marker: %q", marker)
++	}
++
++	// A different protocol on the same UDP port must clear the marker.
++	tuic := &panel.NodeConfig{Protocol: "tuic", ServerPort: 444}
++	buildInbound(testNodeSpec(tuic), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
++	if _, err = os.Stat(markerPath); !os.IsNotExist(err) {
++		t.Fatalf("SNI guard marker was not cleared for TUIC: %v", err)
++	}
++
++	// Hysteria v1 on the selected port must not receive the strict SNI guard.
++	hy1 := &panel.NodeConfig{Protocol: "hysteria", ServerPort: 444, Version: 1}
++	inbound = buildInbound(testNodeSpec(hy1), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
++	tls = inbound["tls"].(M)
++	if _, exists := tls["strict_server_name"]; exists {
++		t.Fatal("SNI guard leaked to Hysteria v1")
++	}
 +}
 +
  func TestBuildInbound_Hysteria2_WithObfs(t *testing.T) {
@@ -592,19 +704,30 @@ build_patched_xboard() {
 }
 
 write_xboard_dropin() {
+  local marker
+  marker=$(xboard_hy2_marker_file "$NODE_PORT")
   mkdir -p "$XBOARD_DROPIN_DIR"
   cat >"$XBOARD_DROPIN_FILE" <<EOF
 [Service]
 Environment=XBOARD_HYSTERIA2_SNI_GUARD=${FAKE_SNI}
+Environment=XBOARD_HYSTERIA2_SNI_GUARD_PORT=${NODE_PORT}
+Environment=XBOARD_HYSTERIA2_SNI_GUARD_MARKER=${marker}
 EOF
   chmod 0644 "$XBOARD_DROPIN_FILE"
 }
 
 wait_for_xboard_udp() {
-  local attempt
+  local attempt marker marker_value
+  marker=$(xboard_hy2_marker_file "$NODE_PORT")
   for attempt in $(seq 1 30); do
     if systemctl is-active --quiet "$XBOARD_SERVICE" && service_owns_udp_port "$XBOARD_SERVICE" "$NODE_PORT"; then
-      return 0
+      if [[ -r $marker ]]; then
+        marker_value=$(<"$marker")
+        [[ $marker_value == "$NODE_PORT $FAKE_SNI" ]] && return 0
+      fi
+      # The patched core writes the marker before binding the matching HY2
+      # inbound. Owning the UDP port without it proves this is not that HY2.
+      return 2
     fi
     systemctl is-failed --quiet "$XBOARD_SERVICE" && return 1
     sleep 1
@@ -614,7 +737,7 @@ wait_for_xboard_udp() {
 
 install_patched_xboard() {
   local built_bin current_bin current_sha previous_patched_sha=""
-  local rollback_bin rollback_dropin patched_sha had_dropin=0
+  local rollback_bin rollback_dropin patched_sha marker start_status=0 had_dropin=0
   current_bin=$(find_xboard_binary) ||
     die "没有找到 xboard-node 可执行文件。"
   [[ $current_bin != *[[:space:]]* ]] || die "xboard-node 路径包含空白字符，无法安全处理。"
@@ -644,11 +767,22 @@ install_patched_xboard() {
 
   write_xboard_dropin
   systemctl stop "$XBOARD_SERVICE"
+  marker=$(xboard_hy2_marker_file "$NODE_PORT")
+  rm -f "$marker"
   install -m 0755 "$built_bin" "$current_bin"
   systemctl daemon-reload
 
-  if ! systemctl start "$XBOARD_SERVICE" || ! wait_for_xboard_udp; then
-    warn "补丁版 xboard-node 启动失败，正在自动回滚。"
+  if ! systemctl start "$XBOARD_SERVICE"; then
+    start_status=1
+  else
+    wait_for_xboard_udp || start_status=$?
+  fi
+  if (( start_status != 0 )); then
+    if (( start_status == 2 )); then
+      warn "xboard-node 的 UDP ${NODE_PORT} 不是面板下发的 Hysteria2，正在恢复原版。"
+    else
+      warn "补丁版 xboard-node 启动失败，正在自动回滚。"
+    fi
     systemctl stop "$XBOARD_SERVICE" >/dev/null 2>&1 || true
     install -m 0755 "$rollback_bin" "$current_bin"
     if (( had_dropin == 1 )); then
@@ -658,7 +792,10 @@ install_patched_xboard() {
     fi
     systemctl daemon-reload
     systemctl start "$XBOARD_SERVICE" >/dev/null 2>&1 || true
-    rm -f "$rollback_bin" "$rollback_dropin"
+    rm -f "$rollback_bin" "$rollback_dropin" "$marker"
+    if (( start_status == 2 )); then
+      return 2
+    fi
     die "补丁版 xboard-node 未能监听 UDP ${NODE_PORT}，原二进制已经恢复。"
   fi
 
@@ -704,6 +841,7 @@ restore_xboard_node() {
     fi
   fi
   rm -f "$XBOARD_PATCH_STATE" "$XBOARD_BACKUP_BIN"
+  rm -f "${XBOARD_HY2_MARKER_PREFIX}-"*.ready
   rm -rf "$XBOARD_SOURCE_DIR" "$SINGBOX_SOURCE_DIR"
 }
 
@@ -956,6 +1094,24 @@ wait_for_udp_service() {
   return 1
 }
 
+wait_for_configured_udp_backend() {
+  case "${UDP_BACKEND:-none}" in
+    xboard)
+      wait_for_xboard_udp
+      ;;
+    singbox)
+      singbox_has_hysteria2_port "$NODE_PORT" || return 2
+      standalone_singbox_version_supported || return 2
+      standalone_singbox_sni_guard_is_configured "$NODE_PORT" "$FAKE_SNI" || return 2
+      wait_for_udp_service "$SINGBOX_SERVICE" || return 1
+      standalone_singbox_hysteria2_is_confirmed "$NODE_PORT" || return 2
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
 install_patched_standalone_singbox() {
   local built_bin current_bin current_sha previous_patched_sha=""
   local rollback_bin rollback_dropin patched_sha had_dropin=0
@@ -988,7 +1144,7 @@ install_patched_standalone_singbox() {
   systemctl stop "$SINGBOX_SERVICE"
   install -m 0755 "$built_bin" "$current_bin"
   systemctl daemon-reload
-  if ! systemctl start "$SINGBOX_SERVICE" || ! wait_for_udp_service "$SINGBOX_SERVICE"; then
+  if ! systemctl start "$SINGBOX_SERVICE" || ! wait_for_configured_udp_backend; then
     warn "补丁版 sing-box 启动失败，正在自动回滚。"
     systemctl stop "$SINGBOX_SERVICE" >/dev/null 2>&1 || true
     install -m 0755 "$rollback_bin" "$current_bin"
@@ -1323,7 +1479,11 @@ detect_install_udp_mode() {
   case "$UDP_BACKEND" in
     xboard)
       UDP_MODE=kernel
-      info "检测到 xboard-node Hysteria2 UDP 后端：${NODE_PORT}。"
+      if xboard_hysteria2_is_confirmed "$NODE_PORT"; then
+        info "已确认 xboard-node Hysteria2 UDP 后端：${NODE_PORT}。"
+      else
+        info "检测到 xboard-node 正在监听 UDP ${NODE_PORT}；安装时将根据实际节点配置确认是否为 Hysteria2。"
+      fi
       ;;
     singbox)
       UDP_MODE=kernel
@@ -1399,7 +1559,7 @@ read_install_values() {
 }
 
 install_or_reconfigure() {
-  local module_path preflight_conf
+  local module_path preflight_conf xboard_status=0
 
   load_state
   read_install_values
@@ -1409,8 +1569,14 @@ install_or_reconfigure() {
   printf '  Nginx 公网端口：%s（用户连接此端口）\n' "$PROXY_PORT"
   printf '  大厂 SNI：%s\n' "$FAKE_SNI"
   case "${UDP_BACKEND:-none}" in
-    xboard) printf '  UDP/HY2：xboard-node 内核 SNI 校验（兼容 Salamander）\n' ;;
-    singbox) printf '  UDP/HY2：官方 sing-box 内核 SNI 校验（兼容 Salamander）\n' ;;
+    xboard)
+      if xboard_hysteria2_is_confirmed "$NODE_PORT" "$FAKE_SNI"; then
+        printf '  UDP/HY2：已确认 xboard-node Hysteria2（兼容 Salamander）\n'
+      else
+        printf '  UDP/HY2：xboard-node UDP 候选，安装时确认协议；非 HY2 自动回退 TCP\n'
+      fi
+      ;;
+    singbox) printf '  UDP/HY2：已确认官方 sing-box Hysteria2（兼容 Salamander）\n' ;;
     *) printf '  UDP/HY2：未识别，自动使用纯 TCP\n' ;;
   esac
   printf '  节点后端配置及密码：保持不变\n'
@@ -1461,18 +1627,31 @@ install_or_reconfigure() {
     die "Nginx 公网端口 $PROXY_PORT 仍被其他服务占用，请重新运行并选择其他端口。"
   fi
 
-  mkdir -p "$BASE_DIR"
-  install -m 0644 "$preflight_conf" "$NGINX_CONF"
-  rm -f "$preflight_conf"
-  write_logrotate_config
-  write_firewall_helper
-  write_service
-
   case "${UDP_BACKEND:-none}" in
     xboard)
       restore_standalone_singbox
       SINGBOX_BIN_PATH=""
-      install_patched_xboard
+      install_patched_xboard || xboard_status=$?
+      if (( xboard_status == 2 )); then
+        UDP_MODE=none
+        UDP_BACKEND=none
+        XBOARD_BIN_PATH=""
+        warn "已确认 xboard-node 的 UDP ${NODE_PORT} 不是 Hysteria2，已恢复原版并回退为纯 TCP。"
+        if ! tcp_port_is_listening "$NODE_PORT"; then
+          rm -f "$preflight_conf"
+          die "该端口也没有 TCP 服务，无法继续配置；节点后端未被修改。"
+        fi
+        rm -f "$preflight_conf"
+        preflight_conf=$(mktemp)
+        write_nginx_config "$module_path" "$preflight_conf"
+        if ! nginx -t -c "$preflight_conf" -p "$BASE_DIR/"; then
+          rm -f "$preflight_conf"
+          die "回退 TCP 后的 Nginx 配置校验失败。"
+        fi
+      elif (( xboard_status != 0 )); then
+        rm -f "$preflight_conf"
+        die "xboard-node HY2 协议确认失败。"
+      fi
       ;;
     singbox)
       restore_xboard_node
@@ -1487,6 +1666,12 @@ install_or_reconfigure() {
       ;;
   esac
 
+  mkdir -p "$BASE_DIR"
+  install -m 0644 "$preflight_conf" "$NGINX_CONF"
+  rm -f "$preflight_conf"
+  write_logrotate_config
+  write_firewall_helper
+  write_service
   write_state
   systemctl daemon-reload
   systemctl enable --now "$APP"
@@ -1529,8 +1714,20 @@ show_status() {
   printf 'Nginx 公网端口：%s（用户连接端口）\n' "$PROXY_PORT"
   printf '大厂 SNI：%s\n' "$FAKE_SNI"
   case "${UDP_BACKEND:-none}" in
-    xboard) printf 'UDP/HY2：xboard-node 内核 SNI 校验\n' ;;
-    singbox) printf 'UDP/HY2：官方 sing-box 内核 SNI 校验\n' ;;
+    xboard)
+      if xboard_hysteria2_is_confirmed "$NODE_PORT" "$FAKE_SNI"; then
+        printf 'UDP/HY2：已确认 xboard-node Hysteria2 内核 SNI 校验\n'
+      else
+        printf 'UDP/HY2：异常，xboard-node 当前未确认是 Hysteria2\n'
+      fi
+      ;;
+    singbox)
+      if standalone_singbox_hysteria2_is_confirmed "$NODE_PORT"; then
+        printf 'UDP/HY2：已确认官方 sing-box Hysteria2 内核 SNI 校验\n'
+      else
+        printf 'UDP/HY2：异常，sing-box 当前未确认是 Hysteria2\n'
+      fi
+      ;;
     *) printf 'UDP/HY2：未启用（纯 TCP）\n' ;;
   esac
 
@@ -1574,17 +1771,20 @@ show_status() {
     fi
     case "${UDP_BACKEND:-none}" in
       xboard)
-        if [[ -f $XBOARD_DROPIN_FILE && -r $XBOARD_PATCH_STATE ]]; then
+        if [[ -f $XBOARD_DROPIN_FILE && -r $XBOARD_PATCH_STATE ]] &&
+          xboard_hysteria2_is_confirmed "$NODE_PORT" "$FAKE_SNI"; then
           printf 'HY2 内核 SNI 补丁：已安装\n'
         else
-          printf 'HY2 内核 SNI 补丁：未完整安装\n'
+          printf 'HY2 内核 SNI 补丁：未完整安装或协议未确认\n'
         fi
         ;;
       singbox)
-        if [[ -f $STANDALONE_SINGBOX_DROPIN_FILE && -r $STANDALONE_SINGBOX_PATCH_STATE ]]; then
+        if [[ -f $STANDALONE_SINGBOX_DROPIN_FILE && -r $STANDALONE_SINGBOX_PATCH_STATE ]] &&
+          standalone_singbox_hysteria2_is_confirmed "$NODE_PORT" &&
+          standalone_singbox_sni_guard_is_configured "$NODE_PORT" "$FAKE_SNI"; then
           printf 'HY2 内核 SNI 补丁：已安装\n'
         else
-          printf 'HY2 内核 SNI 补丁：未完整安装\n'
+          printf 'HY2 内核 SNI 补丁：未完整安装或协议未确认\n'
         fi
         ;;
     esac
@@ -1635,12 +1835,23 @@ show_status() {
 }
 
 start_service() {
-  local udp_service=""
+  local udp_service="" udp_status=0
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装，请先选择“安装 / 重新配置”。"
   if [[ ${UDP_MODE:-none} != none ]]; then
     udp_service=$(udp_backend_service) || die "没有记录有效的 HY2 后端服务。"
-    systemctl start "$udp_service"
+    if [[ ${UDP_BACKEND:-none} == xboard ]] && ! systemctl is-active --quiet "$udp_service"; then
+      rm -f "$(xboard_hy2_marker_file "$NODE_PORT")"
+    fi
+    systemctl start "$udp_service" || die "HY2 后端启动失败。"
+    wait_for_configured_udp_backend || udp_status=$?
+    if (( udp_status != 0 )); then
+      systemctl stop "$APP" >/dev/null 2>&1 || true
+      if (( udp_status == 2 )); then
+        die "目标 UDP ${NODE_PORT} 当前未确认是 Hysteria2，分流服务未启动。"
+      fi
+      die "HY2 后端启动后未正常监听 UDP ${NODE_PORT}，分流服务未启动。"
+    fi
   fi
   systemctl start "$APP"
   ok "服务已启动。"
@@ -1654,13 +1865,23 @@ stop_service() {
 }
 
 restart_service() {
-  local udp_service=""
+  local udp_service="" udp_status=0
   load_state
   [[ -f $SERVICE_FILE ]] || die "尚未安装，请先选择“安装 / 重新配置”。"
   if [[ ${UDP_MODE:-none} != none ]]; then
     udp_service=$(udp_backend_service) || die "没有记录有效的 HY2 后端服务。"
-    systemctl restart "$udp_service"
-    wait_for_udp_service "$udp_service" || die "HY2 后端重启后未监听 UDP ${NODE_PORT}。"
+    systemctl stop "$APP" >/dev/null 2>&1 || true
+    if [[ ${UDP_BACKEND:-none} == xboard ]]; then
+      rm -f "$(xboard_hy2_marker_file "$NODE_PORT")"
+    fi
+    systemctl restart "$udp_service" || die "HY2 后端重启失败；分流服务保持停止。"
+    wait_for_configured_udp_backend || udp_status=$?
+    if (( udp_status != 0 )); then
+      if (( udp_status == 2 )); then
+        die "目标 UDP ${NODE_PORT} 重启后未确认是 Hysteria2；分流服务保持停止。"
+      fi
+      die "HY2 后端重启后未正常监听 UDP ${NODE_PORT}；分流服务保持停止。"
+    fi
   fi
   systemctl restart "$APP"
   ok "服务已重启。"
